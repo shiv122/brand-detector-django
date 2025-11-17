@@ -107,9 +107,15 @@ STATIC_URL = "/static/"
 STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
 # STATICFILES_DIRS is for source files (before collectstatic)
 # STATIC_ROOT is where files are collected to (and where we save frames/videos)
-STATICFILES_DIRS = [
-    os.path.join(BASE_DIR, "static"),
-]
+# Only include static directory if it exists to avoid warnings
+static_dir = os.path.join(BASE_DIR, "static")
+STATICFILES_DIRS = (
+    [
+        static_dir,
+    ]
+    if os.path.exists(static_dir)
+    else []
+)
 
 # Media files
 MEDIA_URL = "/media/"

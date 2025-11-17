@@ -22,18 +22,34 @@ urlpatterns = [
     path("redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
 ]
 
-# Serve static files - works in both development and production
-# Serve static files at /static/ (standard Django)
+# Serve static and media files
+# In production, use a web server (nginx) or WhiteNoise for static files
+# This is a fallback for development and when DEBUG=True
 if settings.DEBUG:
+    # Serve static files at /static/ (standard Django)
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
-
-# Always serve static files at /api/v1/static/ for frontend compatibility (production-safe)
-urlpatterns += [
-    re_path(
-        r"^api/v1/static/(?P<path>.*)$", serve, {"document_root": settings.STATIC_ROOT}
-    ),
-]
-
-# Serve media files in development
-if settings.DEBUG:
+    # Also serve static files at /api/v1/static/ for frontend compatibility
+    urlpatterns += [
+        re_path(
+            r"^api/v1/static/(?P<path>.*)$",
+            serve,
+            {"document_root": settings.STATIC_ROOT},
+        ),
+    ]
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+else:
+    # In production, serve static files at /api/v1/static/ for frontend compatibility
+    # Note: For production, it's recommended to use nginx or WhiteNoise middleware
+    # This is a fallback that works but is not optimal for high traffic
+    urlpatterns += [
+        re_path(
+            r"^api/v1/static/(?P<path>.*)$",
+            serve,
+            {"document_root": settings.STATIC_ROOT},
+        ),
+        re_path(
+            r"^static/(?P<path>.*)$",
+            serve,
+            {"document_root": settings.STATIC_ROOT},
+        ),
+    ]
