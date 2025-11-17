@@ -39,6 +39,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",  # Fast static file serving
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -116,6 +117,22 @@ STATICFILES_DIRS = (
     if os.path.exists(static_dir)
     else []
 )
+
+# WhiteNoise configuration for fast static file serving
+# WhiteNoise serves files directly from STATIC_ROOT with compression and caching
+WHITENOISE_USE_FINDERS = False  # Don't use finders, serve directly from STATIC_ROOT
+WHITENOISE_AUTOREFRESH = DEBUG  # Auto-refresh in development, cache in production
+WHITENOISE_MAX_AGE = 31536000 if not DEBUG else 0  # Cache for 1 year in production
+WHITENOISE_MIMETYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".avi": "video/x-msvideo",
+    ".mov": "video/quicktime",
+}
 
 # Media files
 MEDIA_URL = "/media/"
