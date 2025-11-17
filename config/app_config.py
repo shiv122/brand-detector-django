@@ -22,7 +22,7 @@ class AppConfig:
             settings, "DEFAULT_WEIGHT", "best_cricket.pt"
         )
         self.selected_classification_weight: str = getattr(
-            settings, "DEFAULT_CLASSIFICATION_WEIGHT", ""
+            settings, "DEFAULT_CLASSIFICATION_WEIGHT", "best_cricket_classify.pt"
         )
 
     def get_weight_path(self) -> str:
