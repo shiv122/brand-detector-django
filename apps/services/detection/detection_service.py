@@ -528,7 +528,7 @@ class DetectionService:
                         frame_path = Path(self.config.frames_dir) / frame_filename
                         cv2.imwrite(str(frame_path), annotated_frame)
 
-                        frame_url = f"/static/frames/{frame_filename}"
+                        frame_url = f"/api/v1/static/frames/{frame_filename}"
 
                         # Create frame in database
                         db_frame = Frame.objects.create(
@@ -657,7 +657,7 @@ class DetectionService:
 
             # Send completion
             processed_video_url = (
-                f"/static/{Path(video_path).name}" if create_video else None
+                f"/api/v1/static/{Path(video_path).name}" if create_video else None
             )
             yield f"data: {json.dumps({'type': 'complete', 'message': 'Video processing completed', 'total_frames': processed_count, 'processed_video_url': processed_video_url})}\n\n"
 
@@ -974,7 +974,7 @@ class DetectionService:
         """Get real-time CSV files for a session"""
         csv_files = []
         for csv_file in self.csv_dir.glob(f"*{session_id[:8]}*.csv"):
-            csv_files.append({"main": f"/static/csv_reports/{csv_file.name}"})
+            csv_files.append({"main": f"/api/v1/static/csv_reports/{csv_file.name}"})
         return csv_files[0] if csv_files else {}
 
     def export_session_to_csv(
@@ -1040,7 +1040,7 @@ class DetectionService:
                         ]
                     )
 
-        return {"main": f"/static/csv_reports/{csv_path.name}"}
+        return {"main": f"/api/v1/static/csv_reports/{csv_path.name}"}
 
     def get_available_csv_files(self) -> list:
         """Get list of available CSV files"""
@@ -1049,7 +1049,7 @@ class DetectionService:
             csv_files.append(
                 {
                     "filename": csv_file.name,
-                    "path": f"/static/csv_reports/{csv_file.name}",
+                    "path": f"/api/v1/static/csv_reports/{csv_file.name}",
                     "size": csv_file.stat().st_size,
                     "created": datetime.fromtimestamp(
                         csv_file.stat().st_ctime
