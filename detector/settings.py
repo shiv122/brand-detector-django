@@ -151,7 +151,8 @@ CORS_ALLOW_ALL_ORIGINS = (
 
 # Application-specific settings
 WEIGHTS_DIR = os.path.join(BASE_DIR, "weights")
-DEFAULT_WEIGHT = "best.pt"
+DEFAULT_WEIGHT = os.getenv("DEFAULT_WEIGHT", "best_cricket.pt")
+DEFAULT_CLASSIFICATION_WEIGHT = os.getenv("DEFAULT_CLASSIFICATION_WEIGHT", "")
 DEFAULT_FPS = 1
 DEFAULT_CONFIDENCE = 0.5
 

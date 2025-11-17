@@ -18,7 +18,12 @@ class AppConfig:
             settings, "STATIC_ROOT", os.path.join(settings.BASE_DIR, "staticfiles")
         )
         self.frames_dir: str = str(Path(self.static_dir) / "frames")
-        self.selected_weight: str = getattr(settings, "DEFAULT_WEIGHT", "best.pt")
+        self.selected_weight: str = getattr(
+            settings, "DEFAULT_WEIGHT", "best_cricket.pt"
+        )
+        self.selected_classification_weight: str = getattr(
+            settings, "DEFAULT_CLASSIFICATION_WEIGHT", ""
+        )
 
     def get_weight_path(self) -> str:
         """Get the full path to the selected weight"""
@@ -30,6 +35,7 @@ class AppConfig:
             "frames_per_second": self.frames_per_second,
             "confidence_threshold": self.confidence_threshold,
             "selected_weight": self.selected_weight,
+            "selected_classification_weight": self.selected_classification_weight,
             "weights_dir": self.weights_dir,
             "static_dir": self.static_dir,
         }

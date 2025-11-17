@@ -36,19 +36,43 @@ class ClassificationService:
         self._load_default_model()
 
     def _load_default_model(self):
-        """Load the first available classification model"""
+        """Load the default classification model from config, or first available"""
         available_weights = self.model_service.get_available_weights()
-        if available_weights and len(available_weights) > 0:
-            first_weight = available_weights[0]["name"]
-            success = self.model_service.switch_model(first_weight)
-            if success:
-                print(f"✅ Loaded default classification model: {first_weight}")
-            else:
-                print(f"⚠️ Failed to load default classification model: {first_weight}")
-        else:
+        
+        if not available_weights or len(available_weights) == 0:
             print(
                 "⚠️ No classification weights found in weights/classification_weights directory"
             )
+            return
+        
+        # Try to load the configured default weight first
+        default_weight = self.config.selected_classification_weight
+        weight_to_load = None
+        
+        if default_weight:
+            # Check if the configured weight exists
+            weight_exists = any(
+                w["name"] == default_weight for w in available_weights
+            )
+            if weight_exists:
+                weight_to_load = default_weight
+                print(f"📋 Using configured default classification model: {default_weight}")
+            else:
+                print(
+                    f"⚠️ Configured default classification weight '{default_weight}' not found, "
+                    f"falling back to first available"
+                )
+        
+        # If no configured weight or it doesn't exist, use first available
+        if not weight_to_load:
+            weight_to_load = available_weights[0]["name"]
+            print(f"📋 Using first available classification model: {weight_to_load}")
+        
+        success = self.model_service.switch_model(weight_to_load)
+        if success:
+            print(f"✅ Loaded classification model: {weight_to_load}")
+        else:
+            print(f"⚠️ Failed to load classification model: {weight_to_load}")
 
     def is_model_loaded(self) -> bool:
         """Check if model is loaded"""
