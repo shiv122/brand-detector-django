@@ -1,0 +1,65 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+
+# Ignore SQLite database files
+*.sqlite3
+*.sqlite
+*.db
+db.sqlite3
+db.sqlite
+
+# Ignore environment variables and settings
+.env
+local_settings.py
+
+# Ignore logs and backups
+*.log
+*.bak
+
+# Ignore virtual environments
+venv/
+env/
+.venv/
+
+# Ignore Python bytecode and cache files
+*.pyc
+__pycache__/
+migrations/**/__pycache__/ # Ignore cache in migration directories
+
+# Ignore media and static files (if not managed by a separate system like S3)
+media/
+static/
+
+# Ignore IDE and editor settings
+.vscode/
+.idea/
+
+# Ignore testing and coverage reports
+.tox/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Ignore deployment files
+*.tar.gz
+*.zip
+
+# Operating System specific files
+.DS_Store # macOS
+Thumbs.db # Windows
+
+
+
+staticfiles/*
+!staticfiles/.gitkeep
+
+.DS_Store
