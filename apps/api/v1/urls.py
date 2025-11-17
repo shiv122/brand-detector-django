@@ -12,4 +12,7 @@ urlpatterns = [
     # Classification endpoints
     # Includes: /api/v1/classification/health, /api/v1/classification/weights, etc.
     path("classification/", include("apps.api.v1.controllers.classification")),
+    # Dashboard endpoints
+    # Includes: /api/v1/dashboard/stats
+    path("", include("apps.api.v1.controllers.dashboard")),
 ]
