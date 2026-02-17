@@ -19,10 +19,10 @@ class AppConfig:
         )
         self.frames_dir: str = str(Path(self.static_dir) / "frames")
         self.selected_weight: str = getattr(
-            settings, "DEFAULT_WEIGHT", "best_cricket.pt"
+            settings, "DEFAULT_WEIGHT", "cricket.pt"
         )
         self.selected_classification_weight: str = getattr(
-            settings, "DEFAULT_CLASSIFICATION_WEIGHT", "best_cricket_classify.pt"
+            settings, "DEFAULT_CLASSIFICATION_WEIGHT", "cricket_classify.pt"
         )
 
     def get_weight_path(self) -> str:
