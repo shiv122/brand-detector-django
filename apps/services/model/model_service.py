@@ -37,7 +37,7 @@ class ModelService:
         self.device = self._get_optimal_device()
         self.available_weights: List[Dict] = []
         self._load_available_weights()
-        self._load_default_model()
+        self._preload_all_models()
     
     def _get_optimal_device(self) -> str:
         """Get the optimal device for inference"""
@@ -82,9 +82,55 @@ class ModelService:
             i += 1
         return f"{size_bytes:.1f}{size_names[i]}"
     
-    def _load_default_model(self):
-        """Load the default model"""
-        self.switch_model(self.config.selected_weight)
+    def _preload_all_models(self):
+        """Preload all available models into memory at startup"""
+        print(f"🔄 Preloading all {len(self.available_weights)} detection models...")
+        for weight_info in self.available_weights:
+            weight_name = weight_info["name"]
+            if weight_name not in self.models:
+                try:
+                    weight_path = Path(self.config.weights_dir) / weight_name
+                    print(f"🔄 Loading model: {weight_name} on {self.device}")
+                    model = YOLO(str(weight_path))
+                    model.to(self.device)
+
+                    if self.device == DeviceType.CUDA.value:
+                        model.model.eval()
+                        try:
+                            if hasattr(torch.backends.cudnn, "enabled"):
+                                torch.backends.cudnn.benchmark = True
+                            if torch.cuda.is_available():
+                                torch.backends.cudnn.deterministic = False
+                                torch.backends.cudnn.benchmark = True
+                        except Exception as e:
+                            print(f"⚠️ Could not enable CUDA optimizations: {e}")
+                    elif self.device == DeviceType.MPS.value:
+                        model.model.eval()
+
+                    self.models[weight_name] = model
+                    print(f"✅ Model loaded: {weight_name} on {self.device}")
+                except Exception as e:
+                    print(f"❌ Error loading model {weight_name}: {str(e)}")
+
+        # Set default current_model for backward compatibility
+        default = self.config.selected_weight
+        if default in self.models:
+            self.current_model = self.models[default]
+        elif self.models:
+            first_name = next(iter(self.models))
+            self.current_model = self.models[first_name]
+
+        print(f"✅ All detection models preloaded: {list(self.models.keys())}")
+
+    def get_model(self, weight_name: str) -> YOLO:
+        """Get a specific model by weight name"""
+        if weight_name in self.models:
+            return self.models[weight_name]
+        # Attempt lazy load as fallback
+        success = self.switch_model(weight_name)
+        if success and weight_name in self.models:
+            return self.models[weight_name]
+        raise ValueError(f"Model not found: {weight_name}")
     
     def switch_model(self, weight_name: str) -> bool:
         """Switch to a different weight file"""
@@ -169,31 +215,33 @@ class ModelService:
         return info
     
     def detect_in_image(
-        self, image_data: bytes, confidence_threshold: float = 0.5
+        self, image_data: bytes, confidence_threshold: float = 0.5,
+        weight_name: Optional[str] = None
     ) -> Tuple[List[DetectionResult], Optional[np.ndarray]]:
         """Detect logos in a single image"""
-        if not self.is_loaded():
+        model = self.get_model(weight_name) if weight_name else self.current_model
+        if model is None:
             raise RuntimeError("Model not loaded")
-        
+
         # Convert bytes to numpy array
         nparr = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+
         if img is None:
             raise ValueError("Could not decode image")
-        
+
         # Run detection
-        results = self.current_model(
+        results = model(
             img,
             save=False,
             conf=confidence_threshold,
             device=self.device,
             verbose=False,
         )
-        
+
         detections = []
         annotated_img = None
-        
+
         for result in results:
             boxes = result.boxes
             if boxes is not None:
@@ -201,8 +249,8 @@ class ModelService:
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                     confidence = float(box.conf[0].cpu().numpy())
                     class_id = int(box.cls[0].cpu().numpy())
-                    class_name = self.current_model.names[class_id]
-                    
+                    class_name = model.names[class_id]
+
                     detections.append(
                         DetectionResult(
                             bbox=[float(x1), float(y1), float(x2), float(y2)],
@@ -211,21 +259,23 @@ class ModelService:
                             class_name=class_name,
                         )
                     )
-            
+
             # Get annotated image
             annotated_img = result.plot()
-        
+
         return detections, annotated_img
     
     def detect_in_frame(
-        self, frame: np.ndarray, confidence_threshold: float = 0.5
+        self, frame: np.ndarray, confidence_threshold: float = 0.5,
+        weight_name: Optional[str] = None
     ) -> Tuple[List[DetectionResult], Optional[np.ndarray]]:
         """Detect logos in a video frame"""
-        if not self.is_loaded():
+        model = self.get_model(weight_name) if weight_name else self.current_model
+        if model is None:
             raise RuntimeError("Model not loaded")
-        
+
         # Run detection
-        results = self.current_model(
+        results = model(
             frame,
             save=False,
             conf=confidence_threshold,
@@ -234,10 +284,10 @@ class ModelService:
             half=(self.device == DeviceType.CUDA.value),
             imgsz=640,
         )
-        
+
         detections = []
         annotated_frame = None
-        
+
         for result in results:
             boxes = result.boxes
             if boxes is not None:
@@ -245,8 +295,8 @@ class ModelService:
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                     confidence = float(box.conf[0].cpu().numpy())
                     class_id = int(box.cls[0].cpu().numpy())
-                    class_name = self.current_model.names[class_id]
-                    
+                    class_name = model.names[class_id]
+
                     detections.append(
                         DetectionResult(
                             bbox=[float(x1), float(y1), float(x2), float(y2)],
@@ -255,9 +305,9 @@ class ModelService:
                             class_name=class_name,
                         )
                     )
-            
+
             # Get annotated frame
             annotated_frame = result.plot()
-        
+
         return detections, annotated_frame
 

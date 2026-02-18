@@ -73,10 +73,11 @@ class DetectionService:
         return self.model_service.switch_model(weight_name)
 
     def detect_in_image(
-        self, image_data: bytes, confidence_threshold: float = 0.5
+        self, image_data: bytes, confidence_threshold: float = 0.5,
+        weight_name: Optional[str] = None
     ) -> Tuple[List[DetectionResult], Optional[np.ndarray]]:
         """Detect logos in a single image"""
-        return self.model_service.detect_in_image(image_data, confidence_threshold)
+        return self.model_service.detect_in_image(image_data, confidence_threshold, weight_name=weight_name)
 
     def _crop_detection_box(
         self, frame: np.ndarray, bbox: List[float], padding: int = 40
@@ -94,13 +95,13 @@ class DetectionService:
         return cropped
 
     def _classify_detection(
-        self, frame: np.ndarray, detection: DetectionResult
+        self, frame: np.ndarray, detection: DetectionResult,
+        classification_weight_name: Optional[str] = None
     ) -> Optional[List]:
         """Classify a detection by cropping and running classification model"""
-        if (
-            not self.classification_service
-            or not self.classification_service.is_model_loaded()
-        ):
+        if not self.classification_service:
+            return None
+        if not classification_weight_name and not self.classification_service.is_model_loaded():
             return None
 
         try:
@@ -113,7 +114,7 @@ class DetectionService:
             image_bytes = buffer.tobytes()
 
             classification_results = self.classification_service.classify_image(
-                image_bytes, top_k=3
+                image_bytes, top_k=3, weight_name=classification_weight_name
             )
             return [r.to_dict() for r in classification_results]
         except Exception as e:
@@ -141,20 +142,23 @@ class DetectionService:
 
     def detect_images_handler(self, request, validated_data: dict = None) -> Response:
         """Handle image detection request (data is already validated)"""
-        if not self.is_model_loaded():
+        weight_name = None
+        if validated_data is not None:
+            confidence_threshold = float(
+                validated_data.get("confidence_threshold", 0.5)
+            )
+            weight_name = validated_data.get("weight_name")
+        else:
+            confidence_threshold = float(request.data.get("confidence_threshold", 0.5))
+            weight_name = request.data.get("weight_name")
+
+        if not weight_name and not self.is_model_loaded():
             return Response(
                 {"error": "Model not loaded"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         files = request.FILES.getlist("files")
-        # Use validated_data if provided, otherwise fall back to request.data
-        if validated_data is not None:
-            confidence_threshold = float(
-                validated_data.get("confidence_threshold", 0.5)
-            )
-        else:
-            confidence_threshold = float(request.data.get("confidence_threshold", 0.5))
 
         results = []
         for file in files:
@@ -171,7 +175,7 @@ class DetectionService:
             try:
                 contents = file.read()
                 detections, annotated_image = self.detect_in_image(
-                    contents, confidence_threshold
+                    contents, confidence_threshold, weight_name=weight_name
                 )
 
                 annotated_image_b64 = None
@@ -202,14 +206,6 @@ class DetectionService:
         self, request, validated_data: dict = None
     ) -> StreamingHttpResponse:
         """Handle video detection request with SSE streaming (data is already validated)"""
-        if not self.is_model_loaded():
-            return Response(
-                {"error": "Model not loaded"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        file = request.FILES.get("file")
-        # Use validated_data if provided, otherwise fall back to request.data
         if validated_data is not None:
             file_url = validated_data.get("file_url")
             frames_per_second = int(validated_data.get("frames_per_second", 2))
@@ -218,12 +214,24 @@ class DetectionService:
             )
             create_video = validated_data.get("create_video", False)
             enable_classification = validated_data.get("enable_classification", False)
+            weight_name = validated_data.get("weight_name")
+            classification_weight_name = validated_data.get("classification_weight_name")
         else:
             file_url = request.data.get("file_url")
             frames_per_second = int(request.data.get("frames_per_second", 2))
             confidence_threshold = float(request.data.get("confidence_threshold", 0.5))
             create_video = request.data.get("create_video", False)
             enable_classification = request.data.get("enable_classification", False)
+            weight_name = request.data.get("weight_name")
+            classification_weight_name = request.data.get("classification_weight_name")
+
+        if not weight_name and not self.is_model_loaded():
+            return Response(
+                {"error": "Model not loaded"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        file = request.FILES.get("file")
 
         if file_url:
             # Stream video from URL with download progress
@@ -234,6 +242,8 @@ class DetectionService:
                     confidence_threshold,
                     create_video,
                     enable_classification,
+                    weight_name,
+                    classification_weight_name,
                 ),
                 content_type="text/event-stream",
             )
@@ -246,6 +256,8 @@ class DetectionService:
                     confidence_threshold,
                     create_video,
                     enable_classification,
+                    weight_name,
+                    classification_weight_name,
                 ),
                 content_type="text/event-stream",
             )
@@ -262,6 +274,8 @@ class DetectionService:
         confidence_threshold: float,
         create_video: bool,
         enable_classification: bool,
+        weight_name: Optional[str] = None,
+        classification_weight_name: Optional[str] = None,
     ) -> Generator[str, None, None]:
         """Stream video processing from URL with SSE"""
         video_path = None
@@ -359,6 +373,8 @@ class DetectionService:
                 confidence_threshold,
                 create_video,
                 enable_classification,
+                weight_name,
+                classification_weight_name,
             ):
                 yield event
 
@@ -384,6 +400,8 @@ class DetectionService:
         confidence_threshold: float,
         create_video: bool,
         enable_classification: bool,
+        weight_name: Optional[str] = None,
+        classification_weight_name: Optional[str] = None,
     ) -> Generator[str, None, None]:
         """Stream video processing with SSE"""
         video_path = None
@@ -413,6 +431,8 @@ class DetectionService:
                 confidence_threshold,
                 create_video,
                 enable_classification,
+                weight_name,
+                classification_weight_name,
             ):
                 yield event
 
@@ -433,13 +453,15 @@ class DetectionService:
         confidence_threshold: float,
         create_video: bool,
         enable_classification: bool,
+        weight_name: Optional[str] = None,
+        classification_weight_name: Optional[str] = None,
     ) -> Generator[str, None, None]:
         """Process video and stream results via SSE"""
         # Prepare settings in JSON format
         settings = {
             "enable_classification": enable_classification,
             "create_video": create_video,
-            "model_weight": self.get_current_weight(),
+            "model_weight": weight_name or self.get_current_weight(),
         }
 
         # Create or get session
@@ -504,7 +526,7 @@ class DetectionService:
                 if frame_count % skip_frames == 0:
                     # Run detection
                     detections, annotated_frame = self.model_service.detect_in_frame(
-                        frame, confidence_threshold
+                        frame, confidence_threshold, weight_name=weight_name
                     )
 
                     if annotated_frame is not None:
@@ -513,7 +535,7 @@ class DetectionService:
                         if enable_classification:
                             for detection in detections:
                                 classification = self._classify_detection(
-                                    frame, detection
+                                    frame, detection, classification_weight_name
                                 )
                                 if classification:
                                     classification_data.append(classification)

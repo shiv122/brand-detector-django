@@ -48,7 +48,7 @@ def weights(request):
     return Response(
         {
             "available_weights": _classification_service.get_available_weights(),
-            "current_weight": _classification_service.get_current_weight(),
+            "default_weight": _classification_service.get_current_weight(),
         }
     )
 
@@ -56,7 +56,7 @@ def weights(request):
 @api_view(["POST"])
 @parser_classes([JSONParser])
 def switch_weight(request):
-    """Switch to a different classification weight"""
+    """[DEPRECATED] Switch to a different classification weight. Send weight_name with each request instead."""
     validation = SwitchClassificationWeightRequest(request.data)
 
     if validation.fails():
@@ -83,8 +83,8 @@ def classify_images(request):
         )
 
     # Pass validated data to service
-    request.data.update(validation.validated())
-    return _classification_service.classify_images_handler(request)
+    validated_data = validation.validated()
+    return _classification_service.classify_images_handler(request, validated_data)
 
 
 # URL patterns - Using regex to support both with and without trailing slashes

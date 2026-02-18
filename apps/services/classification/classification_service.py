@@ -2,7 +2,7 @@
 Classification service for image classification - Laravel-style
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from rest_framework.response import Response
 from rest_framework import status
 from config.app_config import AppConfig
@@ -33,46 +33,7 @@ class ClassificationService:
         self.config = config
         self.model_service = ClassificationModelService(config)
         self.image_service = ImageService()
-        self._load_default_model()
-
-    def _load_default_model(self):
-        """Load the default classification model from config, or first available"""
-        available_weights = self.model_service.get_available_weights()
-        
-        if not available_weights or len(available_weights) == 0:
-            print(
-                "⚠️ No classification weights found in weights/classification_weights directory"
-            )
-            return
-        
-        # Try to load the configured default weight first
-        default_weight = self.config.selected_classification_weight
-        weight_to_load = None
-        
-        if default_weight:
-            # Check if the configured weight exists
-            weight_exists = any(
-                w["name"] == default_weight for w in available_weights
-            )
-            if weight_exists:
-                weight_to_load = default_weight
-                print(f"📋 Using configured default classification model: {default_weight}")
-            else:
-                print(
-                    f"⚠️ Configured default classification weight '{default_weight}' not found, "
-                    f"falling back to first available"
-                )
-        
-        # If no configured weight or it doesn't exist, use first available
-        if not weight_to_load:
-            weight_to_load = available_weights[0]["name"]
-            print(f"📋 Using first available classification model: {weight_to_load}")
-        
-        success = self.model_service.switch_model(weight_to_load)
-        if success:
-            print(f"✅ Loaded classification model: {weight_to_load}")
-        else:
-            print(f"⚠️ Failed to load classification model: {weight_to_load}")
+        # Models are preloaded in ClassificationModelService.__init__
 
     def is_model_loaded(self) -> bool:
         """Check if model is loaded"""
@@ -91,13 +52,14 @@ class ClassificationService:
         return self.model_service.switch_model(weight_name)
 
     def classify_image(
-        self, image_data: bytes, top_k: int = 5
+        self, image_data: bytes, top_k: int = 5,
+        weight_name: Optional[str] = None
     ) -> List[ClassificationResult]:
         """Classify an image and return top-k predictions"""
-        if not self.is_model_loaded():
+        if not weight_name and not self.is_model_loaded():
             raise RuntimeError("Classification model not loaded")
 
-        results = self.model_service.classify_image(image_data, top_k)
+        results = self.model_service.classify_image(image_data, top_k, weight_name=weight_name)
 
         classification_results = [
             ClassificationResult(
@@ -123,16 +85,25 @@ class ClassificationService:
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    def classify_images_handler(self, request) -> Response:
+    def classify_images_handler(self, request, validated_data: dict = None) -> Response:
         """Handle image classification request (data is already validated)"""
-        if not self.is_model_loaded():
+        weight_name = None
+        if validated_data:
+            weight_name = validated_data.get("weight_name")
+        elif request.data:
+            weight_name = request.data.get("weight_name")
+
+        if not weight_name and not self.is_model_loaded():
             return Response(
                 {"error": "Classification model not loaded"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         files = request.FILES.getlist("files")
-        top_k = int(request.data.get("top_k", 5))
+        if validated_data:
+            top_k = int(validated_data.get("top_k", 5))
+        else:
+            top_k = int(request.data.get("top_k", 5))
 
         results = []
         for file in files:
@@ -147,7 +118,7 @@ class ClassificationService:
 
             try:
                 contents = file.read()
-                classifications = self.classify_image(contents, top_k)
+                classifications = self.classify_image(contents, top_k, weight_name=weight_name)
 
                 results.append(
                     {

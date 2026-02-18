@@ -23,6 +23,7 @@ class ClassificationModelService:
         self.classification_weights_dir = Path(self.config.weights_dir) / "classification_weights"
         self.classification_weights: List[Dict] = []
         self._load_available_weights()
+        self._preload_all_models()
     
     def _get_optimal_device(self) -> str:
         """Get the optimal device for inference"""
@@ -65,7 +66,47 @@ class ClassificationModelService:
             size_bytes /= 1024.0
             i += 1
         return f"{size_bytes:.1f}{size_names[i]}"
-    
+
+    def _preload_all_models(self):
+        """Preload all available classification models into memory at startup"""
+        print(f"🔄 Preloading all {len(self.classification_weights)} classification models...")
+        for weight_info in self.classification_weights:
+            weight_name = weight_info["name"]
+            if weight_name not in self.models:
+                try:
+                    weight_path = self.classification_weights_dir / weight_name
+                    print(f"🔄 Loading classification model: {weight_name} on {self.device}")
+                    model = YOLO(str(weight_path))
+                    model.to(self.device)
+
+                    if self.device == DeviceType.MPS.value:
+                        model.model.eval()
+
+                    self.models[weight_name] = model
+                    print(f"✅ Classification model loaded: {weight_name} on {self.device}")
+                except Exception as e:
+                    print(f"❌ Error loading classification model {weight_name}: {str(e)}")
+
+        # Set default current_model for backward compatibility
+        default = self.config.selected_classification_weight
+        if default in self.models:
+            self.current_model = self.models[default]
+        elif self.models:
+            first_name = next(iter(self.models))
+            self.current_model = self.models[first_name]
+
+        print(f"✅ All classification models preloaded: {list(self.models.keys())}")
+
+    def get_model(self, weight_name: str) -> YOLO:
+        """Get a specific model by weight name"""
+        if weight_name in self.models:
+            return self.models[weight_name]
+        # Attempt lazy load as fallback
+        success = self.switch_model(weight_name)
+        if success and weight_name in self.models:
+            return self.models[weight_name]
+        raise ValueError(f"Classification model not found: {weight_name}")
+
     def switch_model(self, weight_name: str) -> bool:
         """Switch to a different weight file"""
         try:
@@ -114,37 +155,39 @@ class ClassificationModelService:
         """Get list of available classification weights"""
         return self.classification_weights
     
-    def classify_image(self, image_data: bytes, top_k: int = 5) -> List[Dict]:
+    def classify_image(self, image_data: bytes, top_k: int = 5,
+                       weight_name: Optional[str] = None) -> List[Dict]:
         """Classify an image and return top-k predictions"""
-        if not self.is_loaded():
+        model = self.get_model(weight_name) if weight_name else self.current_model
+        if model is None:
             raise RuntimeError("Classification model not loaded")
-        
+
         nparr = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+
         if img is None:
             raise ValueError("Could not decode image")
-        
-        results = self.current_model(
+
+        results = model(
             img,
             save=False,
             device=self.device,
             verbose=False
         )
-        
+
         classifications = []
-        
+
         for result in results:
             if hasattr(result, 'probs'):
                 probs = result.probs
-                
+
                 if hasattr(probs, 'data'):
                     probs_tensor = probs.data
                     if self.device in [DeviceType.MPS.value, DeviceType.CUDA.value]:
                         all_probs = probs_tensor.cpu().numpy()
                     else:
                         all_probs = probs_tensor.numpy()
-                    
+
                     top_k_indices = np.argsort(all_probs)[-top_k:][::-1]
                     top_k_confidences = all_probs[top_k_indices]
                 elif hasattr(probs, 'top5') and hasattr(probs, 'top5conf'):
@@ -160,19 +203,19 @@ class ClassificationModelService:
                     except:
                         print("Warning: Could not extract probabilities from classification result")
                         continue
-                
+
                 if hasattr(result, 'names') and result.names:
                     class_names = result.names
-                elif hasattr(self.current_model, 'names') and self.current_model.names:
-                    class_names = self.current_model.names
+                elif hasattr(model, 'names') and model.names:
+                    class_names = model.names
                 else:
                     class_names = {}
-                
+
                 for idx, conf in zip(top_k_indices, top_k_confidences):
                     class_id = int(idx)
                     class_name = class_names.get(class_id, f"Class_{class_id}")
                     confidence = float(conf)
-                    
+
                     classifications.append({
                         "class_id": class_id,
                         "class_name": class_name,
@@ -180,7 +223,7 @@ class ClassificationModelService:
                     })
             else:
                 print("Warning: Classification result does not have probs attribute")
-        
+
         classifications.sort(key=lambda x: x["confidence"], reverse=True)
         return classifications[:top_k]
 

@@ -103,12 +103,12 @@ def config(request):
 
 @extend_schema(
     summary="Get available weights",
-    description="Get list of available model weights and current weight",
+    description="Get list of available model weights and default weight. Send weight_name with each detection request to specify which model to use.",
     responses={
         200: {
             "example": {
                 "available_weights": [{"name": "best.pt", "size": 40800000}],
-                "current_weight": "best.pt",
+                "default_weight": "best.pt",
             }
         }
     },
@@ -119,21 +119,21 @@ def weights(request):
     return Response(
         {
             "available_weights": _detection_service.get_available_weights(),
-            "current_weight": _detection_service.get_current_weight(),
+            "default_weight": _detection_service.get_current_weight(),
         }
     )
 
 
 @extend_schema(
-    summary="Switch model weight",
-    description="Switch to a different YOLO model weight",
+    summary="[DEPRECATED] Switch model weight",
+    description="Deprecated: Send weight_name with each detection request instead.",
     request=SwitchWeightRequest,
-    responses={200: {"example": {"message": "Switched to weight: best.pt"}}},
+    responses={200: {"example": {"message": "Switched to weight: best.pt", "deprecated": True}}},
 )
 @api_view(["POST"])
 @parser_classes([JSONParser])
 def switch_weight(request):
-    """Switch to a different weight"""
+    """[DEPRECATED] Switch to a different weight. Send weight_name with each request instead."""
     validation = SwitchWeightRequest(request.data)
 
     if validation.fails():

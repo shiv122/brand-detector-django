@@ -37,6 +37,9 @@ class DetectImagesRequest(BaseRequest):
             # Set default if not provided
             self.data["confidence_threshold"] = 0.5
 
+        if "weight_name" in self.data:
+            self._string("weight_name", min_length=1, max_length=255)
+
 
 class DetectVideoRequest(BaseRequest):
     """Request validation for video detection"""
@@ -77,4 +80,10 @@ class DetectVideoRequest(BaseRequest):
             self._boolean("enable_classification")
         else:
             self.data["enable_classification"] = False
+
+        if "weight_name" in self.data:
+            self._string("weight_name", min_length=1, max_length=255)
+
+        if "classification_weight_name" in self.data:
+            self._string("classification_weight_name", min_length=1, max_length=255)
 

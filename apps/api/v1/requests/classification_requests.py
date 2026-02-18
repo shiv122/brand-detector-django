@@ -25,3 +25,6 @@ class ClassifyImagesRequest(BaseRequest):
             # Set default if not provided
             self.data["top_k"] = 5
 
+        if "weight_name" in self.data:
+            self._string("weight_name", min_length=1, max_length=255)
+
