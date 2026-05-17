@@ -1,8 +1,69 @@
 """
 Detection request validation classes - Laravel-style
 """
+import json
 from typing import Dict, Any, Optional
 from apps.api.v1.requests.base_request import BaseRequest
+
+
+_OCR_SCOPES = ["frame", "detection", "both"]
+
+
+def _parse_ocr_fields(req: BaseRequest, video: bool = False):
+    """Shared OCR field parsing for image + video detection requests."""
+    if "enable_ocr" in req.data:
+        req._boolean("enable_ocr")
+    else:
+        req.data["enable_ocr"] = False
+
+    if "ocr_scope" in req.data and req.data["ocr_scope"]:
+        req._in("ocr_scope", _OCR_SCOPES)
+    else:
+        req.data["ocr_scope"] = "detection"
+
+    if "ocr_template_key" in req.data and req.data["ocr_template_key"]:
+        req._string("ocr_template_key", min_length=1, max_length=128)
+    else:
+        req.data["ocr_template_key"] = "raw"
+
+    if "ocr_custom_prompt" in req.data and req.data["ocr_custom_prompt"]:
+        req._string("ocr_custom_prompt", max_length=8192)
+    else:
+        req.data["ocr_custom_prompt"] = ""
+
+    # ocr_class_filter: optional list of class_names. Accept JSON array or
+    # comma-separated string. Empty/missing = apply to all classes.
+    raw_filter = req.data.get("ocr_class_filter")
+    classes: list = []
+    if raw_filter:
+        if isinstance(raw_filter, list):
+            classes = [str(c).strip() for c in raw_filter if str(c).strip()]
+        elif isinstance(raw_filter, str):
+            stripped = raw_filter.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        classes = [str(c).strip() for c in parsed if str(c).strip()]
+                    else:
+                        req._add_error(
+                            "ocr_class_filter",
+                            "ocr_class_filter must be a JSON array of strings",
+                        )
+                except json.JSONDecodeError:
+                    req._add_error(
+                        "ocr_class_filter",
+                        "ocr_class_filter must be a JSON array or comma-separated string",
+                    )
+            else:
+                classes = [c.strip() for c in stripped.split(",") if c.strip()]
+    req.data["ocr_class_filter"] = classes
+
+    if video:
+        if "ocr_every_n_frames" in req.data:
+            req._integer("ocr_every_n_frames", min_value=1, max_value=600)
+        else:
+            req.data["ocr_every_n_frames"] = 1
 
 
 class UpdateConfigRequest(BaseRequest):
@@ -39,6 +100,8 @@ class DetectImagesRequest(BaseRequest):
 
         if "weight_name" in self.data:
             self._string("weight_name", min_length=1, max_length=255)
+
+        _parse_ocr_fields(self, video=False)
 
 
 class DetectVideoRequest(BaseRequest):
@@ -86,4 +149,6 @@ class DetectVideoRequest(BaseRequest):
 
         if "classification_weight_name" in self.data:
             self._string("classification_weight_name", min_length=1, max_length=255)
+
+        _parse_ocr_fields(self, video=True)
 

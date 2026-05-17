@@ -181,6 +181,12 @@ DEFAULT_CLASSIFICATION_WEIGHT = os.getenv(
 DEFAULT_FPS = 1
 DEFAULT_CONFIDENCE = 0.5
 
+# OCR / Gemini formatting
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OCR_FORMATTER_MODEL = os.getenv("OCR_FORMATTER_MODEL", "gemini-flash-latest")
+OCR_FORMAT_TIMEOUT_SECONDS = float(os.getenv("OCR_FORMAT_TIMEOUT_SECONDS", "8"))
+OCR_CUSTOM_PROMPT_MAX_LEN = int(os.getenv("OCR_CUSTOM_PROMPT_MAX_LEN", "4096"))
+
 # Spectacular (API Documentation) settings
 SPECTACULAR_SETTINGS = {
     "TITLE": "Logo Detection API",

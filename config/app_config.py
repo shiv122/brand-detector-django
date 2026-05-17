@@ -24,6 +24,16 @@ class AppConfig:
         self.selected_classification_weight: str = getattr(
             settings, "DEFAULT_CLASSIFICATION_WEIGHT", "cricket_classify.pt"
         )
+        self.gemini_api_key: str = getattr(settings, "GEMINI_API_KEY", "")
+        self.ocr_formatter_model: str = getattr(
+            settings, "OCR_FORMATTER_MODEL", "gemini-flash-latest"
+        )
+        self.ocr_format_timeout_seconds: float = float(
+            getattr(settings, "OCR_FORMAT_TIMEOUT_SECONDS", 8)
+        )
+        self.ocr_custom_prompt_max_len: int = int(
+            getattr(settings, "OCR_CUSTOM_PROMPT_MAX_LEN", 4096)
+        )
 
     def get_weight_path(self) -> str:
         """Get the full path to the selected weight"""

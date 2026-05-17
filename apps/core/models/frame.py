@@ -16,6 +16,7 @@ class Frame(models.Model):
     frame_url = models.CharField(max_length=500)
     timestamp = models.FloatField(default=0.0)
     total_detections = models.IntegerField(default=0)
+    ocr_summary = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
