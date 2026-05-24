@@ -160,6 +160,15 @@ def switch_weight(request):
                     "default": 0.5,
                     "description": "Confidence threshold (0.0-1.0)",
                 },
+                "enable_classification": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run asset classification on each detection",
+                },
+                "classification_weight_name": {
+                    "type": "string",
+                    "description": "Classification model weight to use when enable_classification is true",
+                },
             },
             "required": ["files"],
         }

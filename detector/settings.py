@@ -32,6 +32,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "corsheaders",
     "drf_spectacular",
+    "django_rq",
     # Local apps
     "apps.core",
     "apps.api",
@@ -181,11 +182,46 @@ DEFAULT_CLASSIFICATION_WEIGHT = os.getenv(
 DEFAULT_FPS = 1
 DEFAULT_CONFIDENCE = 0.5
 
-# OCR / Gemini formatting
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-OCR_FORMATTER_MODEL = os.getenv("OCR_FORMATTER_MODEL", "gemini-flash-latest")
-OCR_FORMAT_TIMEOUT_SECONDS = float(os.getenv("OCR_FORMAT_TIMEOUT_SECONDS", "8"))
-OCR_CUSTOM_PROMPT_MAX_LEN = int(os.getenv("OCR_CUSTOM_PROMPT_MAX_LEN", "4096"))
+# OCR pipeline: GLM-OCR (remote Ollama) extracts text → DeepSeek text API
+# formats it into JSON using the sport prompt. The only supported value is
+# "local"; the env var stays so future providers can be slotted in.
+OCR_PROVIDER = os.getenv("OCR_PROVIDER", "local").strip().lower() or "local"
+
+# GLM-OCR via remote Ollama (the GLM_OCR container).
+LOCAL_OCR_OLLAMA_HOST = os.getenv("LOCAL_OCR_OLLAMA_HOST", "http://localhost:11434")
+LOCAL_OCR_OLLAMA_MODEL = os.getenv("LOCAL_OCR_OLLAMA_MODEL", "glm-ocr")
+LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS = float(
+    os.getenv("LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS", "180")
+)
+LOCAL_OCR_MAX_NEW_TOKENS = int(os.getenv("LOCAL_OCR_MAX_NEW_TOKENS", "2048"))
+LOCAL_OCR_EXTRACT_PROMPT = os.getenv(
+    "LOCAL_OCR_EXTRACT_PROMPT",
+    "Extract all visible text from this image, preserving the original "
+    "layout, line breaks, and reading order. Return only the extracted text.",
+)
+
+# DeepSeek text API (api.deepseek.com) — formats extracted OCR text into JSON.
+DEEPSEEK_TEXT_API_KEY = os.getenv("DEEPSEEK_TEXT_API_KEY", "")
+DEEPSEEK_TEXT_BASE_URL = os.getenv(
+    "DEEPSEEK_TEXT_BASE_URL", "https://api.deepseek.com/v1"
+)
+DEEPSEEK_TEXT_MODEL = os.getenv("DEEPSEEK_TEXT_MODEL", "deepseek-chat")
+DEEPSEEK_TEXT_TIMEOUT_SECONDS = float(os.getenv("DEEPSEEK_TEXT_TIMEOUT_SECONDS", "60"))
+DEEPSEEK_TEXT_MAX_TOKENS = int(os.getenv("DEEPSEEK_TEXT_MAX_TOKENS", "2048"))
+DEEPSEEK_TEXT_TEMPERATURE = float(os.getenv("DEEPSEEK_TEXT_TEMPERATURE", "0.0"))
+
+# Redis / django-rq — used to run OCR off the detection sync path so the
+# frontend gets detections back instantly and OCR results stream in once
+# the worker picks them up.
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+RQ_QUEUES = {
+    "ocr": {
+        "URL": REDIS_URL,
+        "DEFAULT_TIMEOUT": int(os.getenv("RQ_OCR_TIMEOUT", "180")),
+        "RESULT_TTL": int(os.getenv("RQ_RESULT_TTL", "3600")),
+        "FAILURE_TTL": int(os.getenv("RQ_FAILURE_TTL", "3600")),
+    },
+}
 
 # Spectacular (API Documentation) settings
 SPECTACULAR_SETTINGS = {

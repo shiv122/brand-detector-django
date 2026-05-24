@@ -9,7 +9,7 @@ from .classification_requests import (
     SwitchClassificationWeightRequest,
     ClassifyImagesRequest,
 )
-from .ocr_requests import OcrRunRequest, CustomTemplateUpsertRequest
+from .ocr_requests import OcrRunRequest, SportPromptUpsertRequest
 
 __all__ = [
     "UpdateConfigRequest",
@@ -19,5 +19,5 @@ __all__ = [
     "SwitchClassificationWeightRequest",
     "ClassifyImagesRequest",
     "OcrRunRequest",
-    "CustomTemplateUpsertRequest",
+    "SportPromptUpsertRequest",
 ]

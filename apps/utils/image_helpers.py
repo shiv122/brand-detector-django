@@ -60,3 +60,48 @@ def bytes_to_numpy(image_data: bytes) -> Optional[np.ndarray]:
     except Exception as e:
         print(f"Error converting bytes to numpy: {str(e)}")
         return None
+
+
+def resize_for_ocr(
+    frame: np.ndarray, max_dim: int = 1280
+) -> np.ndarray:
+    """Downscale so the longest edge is at most `max_dim`, preserving aspect.
+
+    Smaller images send less bandwidth to the OCR endpoint and let the
+    vision model attend to the same number of tokens worth of content
+    without spending capacity on raw pixel resolution. No upscaling — if
+    the source is already smaller than max_dim we return it unchanged.
+    """
+    if frame is None or frame.size == 0:
+        return frame
+    h, w = frame.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dim:
+        return frame
+    scale = max_dim / float(longest)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def resize_bytes_for_ocr(
+    image_data: bytes, max_dim: int = 1280, quality: int = 90
+) -> bytes:
+    """Decode → resize (longest edge ≤ max_dim) → re-encode as JPEG.
+
+    Returns the original bytes unchanged if decoding fails or the image
+    is already small enough — never silently drops the OCR input.
+    """
+    arr = bytes_to_numpy(image_data)
+    if arr is None:
+        return image_data
+    h, w = arr.shape[:2]
+    if max(h, w) <= max_dim:
+        return image_data
+    resized = resize_for_ocr(arr, max_dim=max_dim)
+    ok, encoded = cv2.imencode(
+        ".jpg", resized, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+    )
+    if not ok:
+        return image_data
+    return encoded.tobytes()

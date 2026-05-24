@@ -1,0 +1,32 @@
+# Build context hygiene — keep the image lean and avoid leaking secrets.
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local DB, media, frame dumps — container starts fresh.
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+frames/
+
+# Secrets and editor cruft.
+.env
+.env.*
+!.env.example
+.git/
+.gitignore
+.DS_Store
+.idea/
+.vscode/
+
+# Docs and tests don't belong in the runtime image.
+*.md
+!README.md
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

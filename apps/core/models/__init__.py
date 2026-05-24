@@ -4,7 +4,7 @@ from .detection import Detection
 from .classification import Classification
 from .session_summary import SessionSummary
 from .ocr import Ocr
-from .custom_ocr_template import CustomOcrTemplate
+from .sport_prompt import SportPrompt
 
 __all__ = [
     "ProcessingSession",
@@ -13,5 +13,5 @@ __all__ = [
     "Classification",
     "SessionSummary",
     "Ocr",
-    "CustomOcrTemplate",
+    "SportPrompt",
 ]

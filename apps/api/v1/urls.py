@@ -15,6 +15,9 @@ urlpatterns = [
     # Dashboard endpoints
     # Includes: /api/v1/dashboard/stats
     path("", include("apps.api.v1.controllers.dashboard")),
+    # Sessions endpoints
+    # Includes: /api/v1/sessions, /api/v1/session/{id}/detail
+    path("", include("apps.api.v1.controllers.sessions")),
     # OCR endpoints
     # Includes: /api/v1/ocr/run
     path("ocr/", include("apps.api.v1.controllers.ocr")),

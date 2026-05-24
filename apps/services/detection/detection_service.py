@@ -11,6 +11,7 @@ import os
 import subprocess
 import shutil
 import csv
+import uuid
 from pathlib import Path
 from typing import List, Tuple, Optional, Generator
 from datetime import datetime
@@ -23,9 +24,15 @@ from apps.services.image.image_service import ImageService
 from apps.services.classification.classification_service import ClassificationService
 from apps.services.counting.counting_service import CountingService
 from apps.services.ocr.ocr_service import OcrService
-from apps.core.models import ProcessingSession, Frame, Detection, Classification, Ocr
+from apps.services.ocr.ocr_queue import enqueue_ocr_job
+from apps.core.models import ProcessingSession, Frame, Detection, Classification, SportPrompt
 from apps.core.enums import ProcessingStatus
 from apps.utils.file_helpers import ensure_directory_exists
+from apps.utils.image_helpers import resize_bytes_for_ocr, resize_for_ocr
+from apps.utils.prompt_render import render_prompt
+
+
+OCR_MAX_DIM = 1280
 import requests
 
 
@@ -57,7 +64,25 @@ class DetectionService:
         ensure_directory_exists(self.config.static_dir)
         ensure_directory_exists(self.config.frames_dir)
         ensure_directory_exists(Path(self.config.static_dir) / "temp_frames")
+        ensure_directory_exists(Path(self.config.static_dir) / "ocr_inputs")
         ensure_directory_exists(str(self.csv_dir))
+
+    def _persist_for_ocr(self, image_bytes: bytes, suffix: str = ".jpg") -> str:
+        """Drop image bytes onto disk so an RQ worker can read them later.
+
+        Resizes so the longest edge is at most OCR_MAX_DIM (1280px). Uses
+        ocr_inputs/ rather than frames_dir because these aren't browsable
+        detection artefacts — they're ephemeral handoffs to the worker.
+        """
+        out_dir = Path(self.config.static_dir) / "ocr_inputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        resized = resize_bytes_for_ocr(image_bytes, max_dim=OCR_MAX_DIM)
+        # Re-encoded as JPEG by resize_bytes_for_ocr when downscaling,
+        # so write .jpg in that case regardless of original suffix.
+        out_suffix = ".jpg" if resized is not image_bytes else suffix
+        out_path = out_dir / f"{uuid.uuid4().hex}{out_suffix}"
+        out_path.write_bytes(resized)
+        return str(out_path)
 
     def is_model_loaded(self) -> bool:
         """Check if model is loaded"""
@@ -124,136 +149,57 @@ class DetectionService:
             print(f"[CLASSIFICATION] Error classifying detection: {str(e)}")
             return None
 
-    @staticmethod
-    def _coerce_bool(value) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.lower() in ("true", "1", "yes")
-        return bool(value)
+    def _resolve_ocr_prompt(
+        self, source: Optional[dict]
+    ) -> Optional[Tuple[str, dict]]:
+        """Resolve an OCR prompt + metadata from the validated request data.
 
-    def _build_ocr_options(self, source: dict) -> dict:
-        """Extract OCR options from a validated dict OR a raw request.data."""
-        if source is None:
-            source = {}
-        enable_ocr = self._coerce_bool(source.get("enable_ocr", False))
-        class_filter = source.get("ocr_class_filter") or []
-        if isinstance(class_filter, str):
-            stripped = class_filter.strip()
-            if stripped.startswith("["):
-                try:
-                    class_filter = json.loads(stripped)
-                except json.JSONDecodeError:
-                    class_filter = [c.strip() for c in stripped.split(",") if c.strip()]
-            else:
-                class_filter = [c.strip() for c in stripped.split(",") if c.strip()]
-        if not isinstance(class_filter, list):
-            class_filter = []
-
-        try:
-            every_n = int(source.get("ocr_every_n_frames", 1))
-        except (TypeError, ValueError):
-            every_n = 1
-        every_n = max(1, every_n)
-
-        return {
-            "enable_ocr": enable_ocr,
-            "ocr_scope": source.get("ocr_scope") or "detection",
-            "ocr_template_key": source.get("ocr_template_key") or "raw",
-            "ocr_custom_prompt": source.get("ocr_custom_prompt") or "",
-            "ocr_class_filter": [str(c) for c in class_filter],
-            "ocr_every_n_frames": every_n,
-        }
-
-    def _ocr_options_enabled(self, options: Optional[dict]) -> bool:
-        return bool(options and options.get("enable_ocr"))
-
-    def _detection_passes_ocr_filter(
-        self, detection: DetectionResult, options: dict
-    ) -> bool:
-        filt = options.get("ocr_class_filter") or []
-        if not filt:
-            return True
-        return detection.class_name in filt
-
-    def _ocr_detection(
-        self, frame: np.ndarray, detection: DetectionResult, options: dict
-    ) -> Optional[dict]:
-        """Run OCR on a single detection bbox. Returns the OCR payload dict
-        or None on failure / OCR disabled."""
-        if not self.ocr_service:
+        Returns (prompt_text, prompt_meta) or None when no OCR is requested
+        / no matching prompt can be found.
+        """
+        if not source:
             return None
-        h, w = frame.shape[:2]
-        roi = self.ocr_service.bbox_to_normalized_roi(
-            detection.bbox, (w, h), padding=10
-        )
-        if roi is None:
-            return None
-        try:
-            return self.ocr_service.process_image_array(
-                frame,
-                roi_normalized=roi,
-                template_key=options.get("ocr_template_key") or "raw",
-                custom_prompt=options.get("ocr_custom_prompt") or "",
+        inline = (source.get("prompt") or "").strip()
+        slug = (source.get("prompt_slug") or "").strip()
+        sport = (source.get("sport") or "").strip()
+
+        if inline:
+            return inline, {"source": "inline"}
+
+        if slug:
+            sp = SportPrompt.objects.filter(slug=slug).first()
+            if sp is not None:
+                brands = list(sp.allowed_brands or [])
+                meta = {
+                    "source": "stored",
+                    "slug": sp.slug,
+                    "name": sp.name,
+                    "sport": sp.sport,
+                }
+                if brands:
+                    meta["allowed_brands"] = brands
+                return render_prompt(sp.prompt, brands), meta
+
+        if sport:
+            sport_lower = sport.lower()
+            sp = (
+                SportPrompt.objects.filter(slug=sport_lower).first()
+                or SportPrompt.objects.filter(sport__iexact=sport_lower)
+                .order_by("-updated_at")
+                .first()
             )
-        except Exception as e:
-            print(f"[OCR] detection OCR failed: {e}")
-            return None
-
-    def _persist_ocr_row(
-        self,
-        session: "ProcessingSession",
-        frame_row: "Frame",
-        detection_row: Optional["Detection"],
-        payload: dict,
-        template_key: str,
-        custom_prompt: str,
-    ) -> None:
-        """Persist an OCR result tied to a frame (and optionally a detection)."""
-        try:
-            Ocr.objects.create(
-                session=session,
-                frame=frame_row,
-                detection=detection_row,
-                template_key=template_key,
-                custom_prompt=custom_prompt or "",
-                raw_text=payload.get("raw_text") or "",
-                raw_lines=payload.get("raw_lines") or [],
-                formatted=payload.get("formatted"),
-                roi=payload.get("roi"),
-                confidence_avg=float(payload.get("confidence_avg") or 0.0),
-                format_error=payload.get("format_error") or "",
-            )
-        except Exception as e:
-            print(f"[OCR] failed to persist OCR row: {e}")
-
-    @staticmethod
-    def _ocr_summary_for_frame(payload: dict) -> dict:
-        """Compact, de-noised payload to store on Frame.ocr_summary."""
-        return {
-            "template_key": payload.get("template_key"),
-            "raw_text": payload.get("raw_text"),
-            "formatted": payload.get("formatted"),
-            "confidence_avg": payload.get("confidence_avg"),
-            "format_error": payload.get("format_error"),
-        }
-
-    def _ocr_frame(
-        self, frame: np.ndarray, options: dict
-    ) -> Optional[dict]:
-        """Run OCR on the full frame. Returns the OCR payload dict or None."""
-        if not self.ocr_service:
-            return None
-        try:
-            return self.ocr_service.process_image_array(
-                frame,
-                roi_normalized=None,
-                template_key=options.get("ocr_template_key") or "raw",
-                custom_prompt=options.get("ocr_custom_prompt") or "",
-            )
-        except Exception as e:
-            print(f"[OCR] frame OCR failed: {e}")
-            return None
+            if sp is not None:
+                brands = list(sp.allowed_brands or [])
+                meta = {
+                    "source": "sport",
+                    "slug": sp.slug,
+                    "name": sp.name,
+                    "sport": sp.sport,
+                }
+                if brands:
+                    meta["allowed_brands"] = brands
+                return render_prompt(sp.prompt, brands), meta
+        return None
 
     def update_config(self, data: dict) -> Response:
         """Update configuration (data is already validated)"""
@@ -277,16 +223,26 @@ class DetectionService:
     def detect_images_handler(self, request, validated_data: dict = None) -> Response:
         """Handle image detection request (data is already validated)"""
         weight_name = None
-        ocr_options: Optional[dict] = None
+        enable_classification = False
+        classification_weight_name = None
         if validated_data is not None:
             confidence_threshold = float(
                 validated_data.get("confidence_threshold", 0.5)
             )
             weight_name = validated_data.get("weight_name")
-            ocr_options = validated_data
+            enable_classification = bool(
+                validated_data.get("enable_classification", False)
+            )
+            classification_weight_name = validated_data.get(
+                "classification_weight_name"
+            )
         else:
             confidence_threshold = float(request.data.get("confidence_threshold", 0.5))
             weight_name = request.data.get("weight_name")
+            enable_classification = bool(
+                request.data.get("enable_classification", False)
+            )
+            classification_weight_name = request.data.get("classification_weight_name")
 
         if not weight_name and not self.is_model_loaded():
             return Response(
@@ -295,8 +251,12 @@ class DetectionService:
             )
 
         files = request.FILES.getlist("files")
-        ocr_enabled = self._ocr_options_enabled(ocr_options)
-        ocr_scope = (ocr_options or {}).get("ocr_scope", "detection")
+
+        # Resolve OCR prompt once for the whole batch (same prompt across files).
+        ocr_resolution = self._resolve_ocr_prompt(validated_data)
+        ocr_active = bool(
+            ocr_resolution and self.ocr_service and self.ocr_service.is_available()
+        )
 
         results = []
         for file in files:
@@ -324,39 +284,36 @@ class DetectionService:
 
                 detection_dicts = [d.to_dict() for d in detections]
 
-                if ocr_enabled and self.ocr_service and self.ocr_service.is_available():
-                    source_frame = self.ocr_service.decode_image(contents)
-
-                    if ocr_scope in ("detection", "both"):
-                        for det, det_dict in zip(detections, detection_dicts):
-                            if not self._detection_passes_ocr_filter(det, ocr_options):
-                                continue
-                            ocr_payload = self._ocr_detection(
-                                source_frame, det, ocr_options
-                            )
-                            if ocr_payload is not None:
-                                det_dict["ocr"] = ocr_payload
-
-                    frame_ocr_payload = None
-                    if ocr_scope in ("frame", "both"):
-                        frame_ocr_payload = self._ocr_frame(source_frame, ocr_options)
-
-                    result_dict = {
-                        "detections": detection_dicts,
-                        "total_detections": len(detections),
-                        "annotated_image": annotated_image_b64,
-                    }
-                    if frame_ocr_payload is not None:
-                        result_dict["frame_ocr"] = frame_ocr_payload
-                    results.append(result_dict)
-                else:
-                    results.append(
-                        {
-                            "detections": detection_dicts,
-                            "total_detections": len(detections),
-                            "annotated_image": annotated_image_b64,
-                        }
+                if enable_classification and detections:
+                    frame = cv2.imdecode(
+                        np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR
                     )
+                    if frame is not None:
+                        for det, det_dict in zip(detections, detection_dicts):
+                            classification_data = self._classify_detection(
+                                frame, det, classification_weight_name
+                            )
+                            if classification_data:
+                                det_dict["classification"] = classification_data
+
+                result_dict: dict = {
+                    "detections": detection_dicts,
+                    "total_detections": len(detections),
+                    "annotated_image": annotated_image_b64,
+                }
+
+                if ocr_active and ocr_resolution is not None:
+                    prompt, meta = ocr_resolution
+                    ext = Path(file.name).suffix or ".jpg"
+                    image_path = self._persist_for_ocr(contents, suffix=ext)
+                    result_dict["ocr_job"] = enqueue_ocr_job(
+                        image_path=image_path,
+                        prompt=prompt,
+                        prompt_meta=meta,
+                    )
+                    result_dict["ocr_prompt_meta"] = meta
+
+                results.append(result_dict)
             except Exception as e:
                 results.append(
                     {
@@ -382,7 +339,6 @@ class DetectionService:
             enable_classification = validated_data.get("enable_classification", False)
             weight_name = validated_data.get("weight_name")
             classification_weight_name = validated_data.get("classification_weight_name")
-            ocr_options = self._build_ocr_options(validated_data)
         else:
             file_url = request.data.get("file_url")
             frames_per_second = int(request.data.get("frames_per_second", 2))
@@ -391,13 +347,16 @@ class DetectionService:
             enable_classification = request.data.get("enable_classification", False)
             weight_name = request.data.get("weight_name")
             classification_weight_name = request.data.get("classification_weight_name")
-            ocr_options = self._build_ocr_options(request.data)
 
         if not weight_name and not self.is_model_loaded():
             return Response(
                 {"error": "Model not loaded"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+        # Resolve OCR prompt up front — looked up once for the whole video,
+        # then the worker reuses the saved Frame JPEG per frame.
+        ocr_resolution = self._resolve_ocr_prompt(validated_data)
 
         file = request.FILES.get("file")
 
@@ -412,7 +371,7 @@ class DetectionService:
                     enable_classification,
                     weight_name,
                     classification_weight_name,
-                    ocr_options,
+                    ocr_resolution,
                 ),
                 content_type="text/event-stream",
             )
@@ -427,7 +386,7 @@ class DetectionService:
                     enable_classification,
                     weight_name,
                     classification_weight_name,
-                    ocr_options,
+                    ocr_resolution,
                 ),
                 content_type="text/event-stream",
             )
@@ -446,7 +405,7 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
-        ocr_options: Optional[dict] = None,
+        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Stream video processing from URL with SSE"""
         video_path = None
@@ -546,7 +505,7 @@ class DetectionService:
                 enable_classification,
                 weight_name,
                 classification_weight_name,
-                ocr_options,
+                ocr_resolution,
             ):
                 yield event
 
@@ -574,7 +533,7 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
-        ocr_options: Optional[dict] = None,
+        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Stream video processing with SSE"""
         video_path = None
@@ -606,7 +565,7 @@ class DetectionService:
                 enable_classification,
                 weight_name,
                 classification_weight_name,
-                ocr_options,
+                ocr_resolution,
             ):
                 yield event
 
@@ -629,29 +588,14 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
-        ocr_options: Optional[dict] = None,
+        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Process video and stream results via SSE"""
-        ocr_options = ocr_options or {"enable_ocr": False}
-        ocr_enabled = self._ocr_options_enabled(ocr_options) and bool(
-            self.ocr_service and self.ocr_service.is_available()
-        )
-        ocr_scope = ocr_options.get("ocr_scope", "detection")
-        ocr_every_n = max(1, int(ocr_options.get("ocr_every_n_frames", 1)))
-
         # Prepare settings in JSON format
         settings = {
             "enable_classification": enable_classification,
             "create_video": create_video,
             "model_weight": weight_name or self.get_current_weight(),
-            "ocr": {
-                "enable_ocr": ocr_enabled,
-                "scope": ocr_scope,
-                "template_key": ocr_options.get("ocr_template_key", "raw"),
-                "custom_prompt": ocr_options.get("ocr_custom_prompt", ""),
-                "class_filter": ocr_options.get("ocr_class_filter", []),
-                "every_n_frames": ocr_every_n,
-            },
         }
 
         # Create or get session
@@ -677,9 +621,7 @@ class DetectionService:
         session.save()
 
         # Initialize CSV file for real-time export
-        csv_file_path, csv_writer = self._initialize_realtime_csv(
-            session_id, ocr_enabled=ocr_enabled
-        )
+        csv_file_path, csv_writer = self._initialize_realtime_csv(session_id)
 
         cap = None
         try:
@@ -754,16 +696,8 @@ class DetectionService:
                             total_detections=len(detections),
                         )
 
-                        # Decide whether to run OCR on this processed frame
-                        run_ocr_this_frame = (
-                            ocr_enabled and processed_count % ocr_every_n == 0
-                        )
-
                         # Save detections to database and prepare detection dicts with classification
                         detection_dicts = []
-                        db_detections: List[Detection] = []
-                        detection_classifications: List[Optional[list]] = []
-                        detection_ocrs: List[Optional[dict]] = []
                         for idx, detection in enumerate(detections):
                             db_detection = Detection.objects.create(
                                 frame=db_frame,
@@ -776,14 +710,12 @@ class DetectionService:
                                 bbox_x2=detection.bbox[2],
                                 bbox_y2=detection.bbox[3],
                             )
-                            db_detections.append(db_detection)
 
                             # Get classification for this detection
                             detection_classification = None
                             if enable_classification and classification_data:
                                 if idx < len(classification_data):
                                     detection_classification = classification_data[idx]
-                            detection_classifications.append(detection_classification)
 
                             # Save classifications if available
                             if detection_classification:
@@ -796,41 +728,12 @@ class DetectionService:
                                         rank=rank,
                                     )
 
-                            # Per-detection OCR (gated by scope and class filter)
-                            detection_ocr_payload = None
-                            if (
-                                run_ocr_this_frame
-                                and ocr_scope in ("detection", "both")
-                                and self._detection_passes_ocr_filter(
-                                    detection, ocr_options
-                                )
-                            ):
-                                detection_ocr_payload = self._ocr_detection(
-                                    frame, detection, ocr_options
-                                )
-                                if detection_ocr_payload is not None:
-                                    self._persist_ocr_row(
-                                        session=session,
-                                        frame_row=db_frame,
-                                        detection_row=db_detection,
-                                        payload=detection_ocr_payload,
-                                        template_key=ocr_options.get(
-                                            "ocr_template_key", "raw"
-                                        ),
-                                        custom_prompt=ocr_options.get(
-                                            "ocr_custom_prompt", ""
-                                        ),
-                                    )
-                            detection_ocrs.append(detection_ocr_payload)
-
-                            # Create detection dict with classification + OCR
+                            # Create detection dict with classification
                             detection_dict = detection.to_dict()
                             if detection_classification:
                                 detection_dict["classification"] = (
                                     detection_classification[:3]
-                                )  # Top 3 only
-                            if detection_ocr_payload is not None:
-                                detection_dict["ocr"] = detection_ocr_payload
+                                )
                             detection_dicts.append(detection_dict)
 
                             # Write to real-time CSV
@@ -841,31 +744,7 @@ class DetectionService:
                                 processed_count,
                                 timestamp,
                                 detection_classification,
-                                detection_ocr_payload,
-                                ocr_enabled=ocr_enabled,
                             )
-
-                        # Frame-level OCR (full frame)
-                        frame_ocr_payload = None
-                        if run_ocr_this_frame and ocr_scope in ("frame", "both"):
-                            frame_ocr_payload = self._ocr_frame(frame, ocr_options)
-                            if frame_ocr_payload is not None:
-                                self._persist_ocr_row(
-                                    session=session,
-                                    frame_row=db_frame,
-                                    detection_row=None,
-                                    payload=frame_ocr_payload,
-                                    template_key=ocr_options.get(
-                                        "ocr_template_key", "raw"
-                                    ),
-                                    custom_prompt=ocr_options.get(
-                                        "ocr_custom_prompt", ""
-                                    ),
-                                )
-                                db_frame.ocr_summary = self._ocr_summary_for_frame(
-                                    frame_ocr_payload
-                                )
-                                db_frame.save(update_fields=["ocr_summary"])
 
                         # Update counting
                         frame_logo_counts = {}
@@ -879,9 +758,35 @@ class DetectionService:
                         # Store for video creation
                         detection_results[frame_count] = (detections, annotated_frame)
 
+                        # Enqueue OCR for this frame if the user opted in.
+                        # Save the ORIGINAL (un-annotated) frame downscaled
+                        # to OCR_MAX_DIM. The annotated frame has bbox
+                        # rectangles + class labels drawn on it, which OCR
+                        # would pick up as text overlays — so we use the
+                        # raw `frame` from cap.read() before detection ran.
+                        ocr_job_info: Optional[dict] = None
+                        if ocr_resolution is not None and self.ocr_service and self.ocr_service.is_available():
+                            prompt, meta = ocr_resolution
+                            ocr_input_dir = (
+                                Path(self.config.static_dir) / "ocr_inputs"
+                            )
+                            ocr_input_dir.mkdir(parents=True, exist_ok=True)
+                            ocr_input_path = ocr_input_dir / frame_filename
+                            cv2.imwrite(
+                                str(ocr_input_path),
+                                resize_for_ocr(frame, max_dim=OCR_MAX_DIM),
+                            )
+                            ocr_job_info = enqueue_ocr_job(
+                                image_path=str(ocr_input_path),
+                                prompt=prompt,
+                                prompt_meta=meta,
+                                frame_id=db_frame.id,
+                            )
+
                         # Stream frame data via SSE (minimal data - no large session_summary)
                         frame_data = {
                             "type": "frame",
+                            "frame_id": db_frame.id,
                             "frame_number": processed_count,
                             "frame_url": frame_url,
                             "detections": detection_dicts,
@@ -889,8 +794,8 @@ class DetectionService:
                             "timestamp": timestamp,
                             "logo_counts": frame_logo_counts,
                         }
-                        if frame_ocr_payload is not None:
-                            frame_data["frame_ocr"] = frame_ocr_payload
+                        if ocr_job_info is not None:
+                            frame_data["ocr_job"] = ocr_job_info
                         yield f"data: {json.dumps(frame_data)}\n\n"
 
                         # Send session summary only every 10 frames to reduce data size
@@ -961,7 +866,7 @@ class DetectionService:
             if cap:
                 cap.release()
 
-    def _initialize_realtime_csv(self, session_id: str, ocr_enabled: bool = False) -> tuple:
+    def _initialize_realtime_csv(self, session_id: str) -> tuple:
         """Initialize real-time CSV file for session"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = f"{timestamp}_{session_id[:8]}"
@@ -970,22 +875,19 @@ class DetectionService:
 
         csv_file = open(csv_path, "w", newline="", encoding="utf-8")
         csv_writer = csv.writer(csv_file)
-        # Write creation timestamp
         creation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         csv_writer.writerow(["Created", creation_time])
-        csv_writer.writerow([])  # Empty row for spacing
-        header = [
-            "Brand",
-            "Frame Number",
-            "Timestamp",
-            "Confidence",
-            "Bounding Box",
-            "Classification",
-        ]
-        if ocr_enabled:
-            header.extend(["OCR Text", "OCR Formatted"])
-        csv_writer.writerow(header)
-
+        csv_writer.writerow([])
+        csv_writer.writerow(
+            [
+                "Brand",
+                "Frame Number",
+                "Timestamp",
+                "Confidence",
+                "Bounding Box",
+                "Classification",
+            ]
+        )
         return csv_file, csv_writer
 
     def _write_to_realtime_csv(
@@ -996,8 +898,6 @@ class DetectionService:
         frame_number: int,
         timestamp: float,
         classification: Optional[List] = None,
-        ocr_payload: Optional[dict] = None,
-        ocr_enabled: bool = False,
     ):
         """Write detection to real-time CSV"""
         box_str = f"[{detection.bbox_x1:.1f},{detection.bbox_y1:.1f},{detection.bbox_x2:.1f},{detection.bbox_y2:.1f}]"
@@ -1013,25 +913,16 @@ class DetectionService:
         else:
             classification_str = "N/A"
 
-        row = [
-            detection.class_name,
-            frame_number,
-            f"{timestamp:.2f}",
-            confidence_str,
-            box_str,
-            classification_str,
-        ]
-        if ocr_enabled:
-            ocr_text = ""
-            ocr_formatted = ""
-            if ocr_payload:
-                ocr_text = (ocr_payload.get("raw_text") or "").replace("\n", " | ")
-                formatted = ocr_payload.get("formatted")
-                if formatted is not None:
-                    ocr_formatted = json.dumps(formatted, ensure_ascii=False)
-            row.extend([ocr_text, ocr_formatted])
-        csv_writer.writerow(row)
-        # Flush immediately to disk for real-time access
+        csv_writer.writerow(
+            [
+                detection.class_name,
+                frame_number,
+                f"{timestamp:.2f}",
+                confidence_str,
+                box_str,
+                classification_str,
+            ]
+        )
         csv_file.flush()
 
     def _create_video_background(
