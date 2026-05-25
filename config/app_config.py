@@ -50,6 +50,11 @@ class AppConfig:
             ),
         )
 
+        # Stage-2 formatter provider switch: "deepseek" | "gemini".
+        self.text_formatter_provider: str = str(
+            getattr(settings, "TEXT_FORMATTER_PROVIDER", "deepseek")
+        ).strip().lower() or "deepseek"
+
         # DeepSeek text API — formats GLM-OCR text into JSON using the
         # sport prompt.
         self.deepseek_text_api_key: str = getattr(
@@ -69,6 +74,28 @@ class AppConfig:
         )
         self.deepseek_text_temperature: float = float(
             getattr(settings, "DEEPSEEK_TEXT_TEMPERATURE", 0.0)
+        )
+
+        # Gemini text API — alternative stage-2 formatter (Google AI Studio).
+        self.gemini_text_api_key: str = getattr(
+            settings, "GEMINI_TEXT_API_KEY", ""
+        )
+        self.gemini_text_base_url: str = getattr(
+            settings,
+            "GEMINI_TEXT_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta",
+        )
+        self.gemini_text_model: str = getattr(
+            settings, "GEMINI_TEXT_MODEL", "gemini-2.5-flash-lite"
+        )
+        self.gemini_text_timeout_seconds: float = float(
+            getattr(settings, "GEMINI_TEXT_TIMEOUT_SECONDS", 60)
+        )
+        self.gemini_text_max_tokens: int = int(
+            getattr(settings, "GEMINI_TEXT_MAX_TOKENS", 2048)
+        )
+        self.gemini_text_temperature: float = float(
+            getattr(settings, "GEMINI_TEXT_TEMPERATURE", 0.0)
         )
 
     def get_weight_path(self) -> str:

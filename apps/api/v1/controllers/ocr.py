@@ -200,8 +200,12 @@ def run_ocr(request):
             missing.append("LOCAL_OCR_OLLAMA_HOST")
         if not _config.local_ocr_ollama_model:
             missing.append("LOCAL_OCR_OLLAMA_MODEL")
-        if not _config.deepseek_text_api_key:
-            missing.append("DEEPSEEK_TEXT_API_KEY")
+        if _config.text_formatter_provider == "gemini":
+            if not _config.gemini_text_api_key:
+                missing.append("GEMINI_TEXT_API_KEY")
+        else:
+            if not _config.deepseek_text_api_key:
+                missing.append("DEEPSEEK_TEXT_API_KEY")
         err = (
             f"OCR endpoint is not configured — set "
             f"{', '.join(missing) or '<unknown>'} in .env, then restart."

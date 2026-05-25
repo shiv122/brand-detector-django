@@ -200,6 +200,10 @@ LOCAL_OCR_EXTRACT_PROMPT = os.getenv(
     "layout, line breaks, and reading order. Return only the extracted text.",
 )
 
+# Stage-2 text formatter provider — "deepseek" (default) or "gemini".
+# Both turn raw GLM-OCR text into the prompted JSON shape; gemini is faster.
+TEXT_FORMATTER_PROVIDER = os.getenv("TEXT_FORMATTER_PROVIDER", "deepseek").strip().lower() or "deepseek"
+
 # DeepSeek text API (api.deepseek.com) — formats extracted OCR text into JSON.
 DEEPSEEK_TEXT_API_KEY = os.getenv("DEEPSEEK_TEXT_API_KEY", "")
 DEEPSEEK_TEXT_BASE_URL = os.getenv(
@@ -209,6 +213,17 @@ DEEPSEEK_TEXT_MODEL = os.getenv("DEEPSEEK_TEXT_MODEL", "deepseek-chat")
 DEEPSEEK_TEXT_TIMEOUT_SECONDS = float(os.getenv("DEEPSEEK_TEXT_TIMEOUT_SECONDS", "60"))
 DEEPSEEK_TEXT_MAX_TOKENS = int(os.getenv("DEEPSEEK_TEXT_MAX_TOKENS", "2048"))
 DEEPSEEK_TEXT_TEMPERATURE = float(os.getenv("DEEPSEEK_TEXT_TEMPERATURE", "0.0"))
+
+# Gemini text API (generativelanguage.googleapis.com) — alternative stage-2
+# formatter. Default model is 2.5 Flash-Lite for lowest latency.
+GEMINI_TEXT_API_KEY = os.getenv("GEMINI_TEXT_API_KEY", "")
+GEMINI_TEXT_BASE_URL = os.getenv(
+    "GEMINI_TEXT_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
+)
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash-lite")
+GEMINI_TEXT_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TEXT_TIMEOUT_SECONDS", "60"))
+GEMINI_TEXT_MAX_TOKENS = int(os.getenv("GEMINI_TEXT_MAX_TOKENS", "2048"))
+GEMINI_TEXT_TEMPERATURE = float(os.getenv("GEMINI_TEXT_TEMPERATURE", "0.0"))
 
 # Redis / django-rq — used to run OCR off the detection sync path so the
 # frontend gets detections back instantly and OCR results stream in once

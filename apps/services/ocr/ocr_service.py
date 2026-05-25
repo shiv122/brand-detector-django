@@ -3,8 +3,8 @@ OCR service — two-stage pipeline behind a single provider name "local":
 
   1. GLM-OCR via a remote Ollama HTTP server (the GLM_OCR container) extracts
      raw text from the image.
-  2. DeepSeek text API (api.deepseek.com) formats the extracted text into
-     JSON using the sport prompt supplied by the caller.
+  2. A text formatter (DeepSeek or Gemini, chosen by TEXT_FORMATTER_PROVIDER)
+     turns the extracted text into JSON using the sport prompt.
 
 Result shape (formatted / raw_text / prompt / timing_ms / format_error) is
 preserved so downstream callers don't change.
@@ -210,12 +210,13 @@ class OcrService:
         return self.config.ocr_provider
 
     def is_available(self) -> bool:
-        return bool(
-            self.config.local_ocr_ollama_host
-            and self.config.local_ocr_ollama_model
-            and self.config.deepseek_text_api_key
-            and self.config.deepseek_text_base_url
-        )
+        if not (self.config.local_ocr_ollama_host and self.config.local_ocr_ollama_model):
+            return False
+        provider = self.config.text_formatter_provider
+        if provider == "gemini":
+            return bool(self.config.gemini_text_api_key and self.config.gemini_text_base_url)
+        # default: deepseek
+        return bool(self.config.deepseek_text_api_key and self.config.deepseek_text_base_url)
 
     def run(self, image_data: bytes, prompt: str) -> Dict[str, Any]:
         if self.provider != "local":
@@ -231,14 +232,25 @@ class OcrService:
     # ----------------------------------------------------------------- local
 
     def _run_local(self, image_data: bytes, prompt: str) -> Dict[str, Any]:
-        if not self.config.deepseek_text_api_key:
-            return {
-                "error": (
-                    "DEEPSEEK_TEXT_API_KEY is not set — needed to format "
-                    "extracted text into JSON."
-                ),
-                "prompt": prompt,
-            }
+        formatter_provider = self.config.text_formatter_provider
+        if formatter_provider == "gemini":
+            if not self.config.gemini_text_api_key:
+                return {
+                    "error": (
+                        "GEMINI_TEXT_API_KEY is not set — needed to format "
+                        "extracted text into JSON."
+                    ),
+                    "prompt": prompt,
+                }
+        else:
+            if not self.config.deepseek_text_api_key:
+                return {
+                    "error": (
+                        "DEEPSEEK_TEXT_API_KEY is not set — needed to format "
+                        "extracted text into JSON."
+                    ),
+                    "prompt": prompt,
+                }
 
         debug = _ocr_debug_enabled()
 
@@ -288,8 +300,14 @@ class OcrService:
                 f"text_len={len(extracted_text)}"
             )
 
-        # Stage 2: DeepSeek text API formats into JSON.
-        format_result = self._call_deepseek_text(prompt, extracted_text)
+        # Stage 2: text formatter (DeepSeek or Gemini) shapes raw text into JSON.
+        if formatter_provider == "gemini":
+            format_result = self._call_gemini_text(prompt, extracted_text)
+            timing_prefix = "gemini_text"
+        else:
+            format_result = self._call_deepseek_text(prompt, extracted_text)
+            timing_prefix = "deepseek_text"
+
         if "error" in format_result:
             return {
                 **format_result,
@@ -304,16 +322,27 @@ class OcrService:
 
         formatter_text = format_result["text"]
         usage = format_result.get("usage", {})
+
+        if debug:
+            print(
+                f"[OCR/Local] format via {formatter_provider} "
+                f"model={format_result.get('model')} "
+                f"net={format_result.get('network_ms', 0)}ms "
+                f"tokens=in:{usage.get('prompt_tokens', usage.get('input_tokens', 0))}/"
+                f"out:{usage.get('completion_tokens', usage.get('output_tokens', 0))}"
+            )
+
         base = {
             "provider": "local",
             "timing_ms": {
                 **glm_timing,
-                "deepseek_text_network": format_result.get("network_ms"),
-                "deepseek_text_completion_tokens": usage.get("completion_tokens"),
-                "deepseek_text_total_tokens": usage.get("total_tokens"),
+                f"{timing_prefix}_network": format_result.get("network_ms"),
+                f"{timing_prefix}_completion_tokens": usage.get("completion_tokens"),
+                f"{timing_prefix}_total_tokens": usage.get("total_tokens"),
             },
-            "deepseek_text_id": format_result.get("response_id"),
-            "deepseek_text_model": format_result.get("model"),
+            f"{timing_prefix}_id": format_result.get("response_id"),
+            f"{timing_prefix}_model": format_result.get("model"),
+            "text_formatter_provider": formatter_provider,
             "glm_ocr_text": extracted_text,
         }
         result = _parse_assistant_text(formatter_text, prompt, base)
@@ -399,4 +428,100 @@ class OcrService:
             "usage": data.get("usage") or {},
             "response_id": data.get("id"),
             "model": data.get("model"),
+        }
+
+    # ---------------------------------------------- Gemini text helper
+
+    def _call_gemini_text(self, prompt: str, ocr_text: str) -> Dict[str, Any]:
+        """POST generativelanguage.googleapis.com to format OCR text into JSON.
+
+        Uses Gemini's native REST API (not the OpenAI-compat shim) so we get
+        proper usage metadata and avoid auth-header quirks. The system prompt
+        goes in `systemInstruction`, the user text in `contents`.
+        """
+        model = self.config.gemini_text_model
+        url = (
+            f"{self.config.gemini_text_base_url.rstrip('/')}"
+            f"/models/{model}:generateContent"
+        )
+        body: Dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": prompt}]},
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                "Below is OCR text extracted from an image. Apply the "
+                                "instructions in the system message to this text and "
+                                "return the result as the system message specifies.\n\n"
+                                "--- OCR TEXT ---\n"
+                                f"{ocr_text}\n"
+                                "--- END ---"
+                            )
+                        }
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "temperature": self.config.gemini_text_temperature,
+                "maxOutputTokens": self.config.gemini_text_max_tokens,
+            },
+        }
+
+        t0 = time.perf_counter()
+        try:
+            resp = requests.post(
+                url,
+                json=body,
+                headers={
+                    "x-goog-api-key": self.config.gemini_text_api_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=self.config.gemini_text_timeout_seconds,
+            )
+        except requests.RequestException as e:
+            return {"error": f"Gemini text API request failed: {e}"}
+        network_ms = int((time.perf_counter() - t0) * 1000)
+
+        if not resp.ok:
+            return {
+                "error": f"Gemini text API {resp.status_code}: {resp.text[:300]}",
+                "timing_ms": {"network": network_ms},
+            }
+
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            return {
+                "error": f"Gemini text response was not JSON: {e}",
+                "timing_ms": {"network": network_ms},
+            }
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return {
+                "error": f"Gemini text API returned no candidates: {data}",
+                "timing_ms": {"network": network_ms},
+            }
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+        if not text:
+            text = json.dumps(candidates[0])
+
+        usage_md = data.get("usageMetadata") or {}
+        # Normalize keys to match the deepseek shape so downstream code
+        # (which reads usage.prompt_tokens / completion_tokens) keeps working.
+        usage = {
+            "prompt_tokens": usage_md.get("promptTokenCount"),
+            "completion_tokens": usage_md.get("candidatesTokenCount"),
+            "total_tokens": usage_md.get("totalTokenCount"),
+        }
+
+        return {
+            "text": text,
+            "network_ms": network_ms,
+            "usage": usage,
+            "response_id": data.get("responseId"),
+            "model": data.get("modelVersion") or model,
         }

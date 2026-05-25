@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 import cv2
@@ -7,6 +8,19 @@ from ultralytics import YOLO
 import torch
 from config.app_config import AppConfig
 from apps.core.enums import DeviceType
+
+
+def _is_rq_worker() -> bool:
+    """True when this process was launched as an RQ worker / worker-pool.
+
+    Workers only ever call the OCR HTTP service — they never need YOLO
+    weights. Preloading them inside 8 workers in parallel thrashes Apple
+    Silicon MPS memory and gets the workers OOM-killed. Skip preload in
+    that context. Override with SKIP_MODEL_PRELOAD=0 if you ever need it.
+    """
+    if os.getenv("SKIP_MODEL_PRELOAD", "").lower() in ("1", "true", "yes"):
+        return True
+    return any("rqworker" in arg for arg in sys.argv)
 
 
 class DetectionResult:
@@ -34,8 +48,16 @@ class ModelService:
         self.config = config
         self.models: Dict[str, YOLO] = {}  # Cache for loaded models
         self.current_model: Optional[YOLO] = None
-        self.device = self._get_optimal_device()
         self.available_weights: List[Dict] = []
+        if _is_rq_worker():
+            # Workers never need detection models. Don't even probe torch /
+            # MPS — on macOS a touch of `torch.backends.mps.is_available()`
+            # in the parent corrupts MPS state across fork() and kills the
+            # worker children mid-job.
+            print("⏭️  Skipping ModelService init (rqworker context)")
+            self.device = DeviceType.CPU.value
+            return
+        self.device = self._get_optimal_device()
         self._load_available_weights()
         self._preload_all_models()
     
@@ -84,6 +106,9 @@ class ModelService:
     
     def _preload_all_models(self):
         """Preload all available models into memory at startup"""
+        if _is_rq_worker():
+            print("⏭️  Skipping detection-model preload (rqworker context)")
+            return
         print(f"🔄 Preloading all {len(self.available_weights)} detection models...")
         for weight_info in self.available_weights:
             weight_name = weight_info["name"]

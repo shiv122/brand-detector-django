@@ -2,6 +2,7 @@
 Classification model service for YOLO classification models
 """
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Dict
 import cv2
@@ -12,6 +13,13 @@ from config.app_config import AppConfig
 from apps.core.enums import DeviceType
 
 
+def _is_rq_worker() -> bool:
+    """Skip preload when running as an rqworker — see model_service.py."""
+    if os.getenv("SKIP_MODEL_PRELOAD", "").lower() in ("1", "true", "yes"):
+        return True
+    return any("rqworker" in arg for arg in sys.argv)
+
+
 class ClassificationModelService:
     """Service for managing YOLO classification models"""
     
@@ -19,9 +27,13 @@ class ClassificationModelService:
         self.config = config
         self.models: Dict[str, YOLO] = {}
         self.current_model: Optional[YOLO] = None
-        self.device = self._get_optimal_device()
         self.classification_weights_dir = Path(self.config.weights_dir) / "classification_weights"
         self.classification_weights: List[Dict] = []
+        if _is_rq_worker():
+            print("⏭️  Skipping ClassificationModelService init (rqworker context)")
+            self.device = DeviceType.CPU.value
+            return
+        self.device = self._get_optimal_device()
         self._load_available_weights()
         self._preload_all_models()
     
@@ -69,6 +81,9 @@ class ClassificationModelService:
 
     def _preload_all_models(self):
         """Preload all available classification models into memory at startup"""
+        if _is_rq_worker():
+            print("⏭️  Skipping classification-model preload (rqworker context)")
+            return
         print(f"🔄 Preloading all {len(self.classification_weights)} classification models...")
         for weight_info in self.classification_weights:
             weight_name = weight_info["name"]
