@@ -26,25 +26,26 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 
 WORKDIR /app
 
-# Python deps + strip in a single layer. The uv cache lives in a buildkit
-# cache mount (not in the image layer) so peak disk during install stays
-# low and the wheels never bloat the final image. The strip + pyc removal
-# run inside the same RUN so deletes actually shrink the layer.
+# Python deps. The uv cache lives in a buildkit cache mount (not in the
+# image layer) so peak disk during install stays low and wheels never
+# bloat the final image.
+#
+# Only strip wheels that torch does NOT dynamically link at `import torch`
+# time. Stripping cusparselt / cusparse / cusolver / cudnn breaks import
+# with "libXXX.so.N: cannot open shared object file" because torch's _C
+# extension is built with those linkages even though YOLO inference
+# never exercises them. The safe-to-strip set below trims ~3-4 GB.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --frozen --no-dev --python 3.11 \
  && uv pip uninstall \
         triton \
         nvidia-nccl-cu12 \
-        nvidia-cusparselt-cu12 \
-        nvidia-cusparse-cu12 \
-        nvidia-cusolver-cu12 \
         nvidia-cufft-cu12 \
         nvidia-curand-cu12 \
         nvidia-nvshmem-cu12 \
         nvidia-cuda-cupti-cu12 \
         nvidia-nvtx-cu12 \
-        nvidia-cudnn-cu12 \
  && find /app/.venv -depth -type d -name '__pycache__' -exec rm -rf {} + \
  && find /app/.venv -depth -type d -name 'tests' -exec rm -rf {} + \
  && find /app/.venv -type f -name '*.pyc' -delete
@@ -72,7 +73,8 @@ ENV DJANGO_SETTINGS_MODULE=detector.settings \
     LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS=180 \
     REDIS_URL=redis://127.0.0.1:6379/0 \
     PORT=8000 \
-    WEB_CONCURRENCY=2
+    WEB_CONCURRENCY=2 \
+    RQ_WORKERS=12
 
 EXPOSE 8000
 

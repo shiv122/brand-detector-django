@@ -288,7 +288,7 @@ def export_session_xlsx(request, session_id):
         "Brand",
         "Instances",
         "Size",
-        "OCR Raw Text",
+        "Raw Text",
     ]
     ws.append(headers)
     header_font = Font(bold=True, color="FFFFFF")
