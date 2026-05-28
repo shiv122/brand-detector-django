@@ -2,7 +2,11 @@
 URL configuration for detector project.
 """
 
+import os
+from pathlib import Path
+
 from django.contrib import admin
+from django.http import JsonResponse
 from django.urls import path, include, re_path
 from django.conf import settings
 from django.conf.urls.static import static
@@ -13,7 +17,28 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
 )
 
+_BUILD_TIME_FILE = Path("/app/BUILD_TIME")
+
+
+def root_index(_request):
+    build_time = "dev"
+    if _BUILD_TIME_FILE.exists():
+        try:
+            build_time = _BUILD_TIME_FILE.read_text().strip() or "unknown"
+        except OSError:
+            build_time = "unknown"
+    return JsonResponse(
+        {
+            "service": "detector-backend",
+            "status": "ok",
+            "build_time": build_time,
+            "git_sha": os.environ.get("BUILD_GIT_SHA", "unknown"),
+        }
+    )
+
+
 urlpatterns = [
+    path("", root_index, name="root-index"),
     path("admin/", admin.site.urls),
     path("api/", include("apps.api.urls")),
     # API Documentation

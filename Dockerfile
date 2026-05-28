@@ -30,22 +30,16 @@ WORKDIR /app
 # image layer) so peak disk during install stays low and wheels never
 # bloat the final image.
 #
-# Only strip wheels that torch does NOT dynamically link at `import torch`
-# time. Stripping cusparselt / cusparse / cusolver / cudnn breaks import
-# with "libXXX.so.N: cannot open shared object file" because torch's _C
-# extension is built with those linkages even though YOLO inference
-# never exercises them. The safe-to-strip set below trims ~3-4 GB.
+# Strip only what torch genuinely never loads at `import torch` time.
+# Across torch 2.4+ the CUDA wheels (cupti, nvtx, cudnn, cublas, cufft,
+# curand, cusparse, cusparselt, cusolver, nccl, nvshmem) ARE all linked
+# or dlopen'd from torch._C — stripping any of them breaks import with
+# "libXXX.so.N: cannot open shared object file". triton is the lone
+# pure-python compile-time dep that YOLO inference never touches.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --frozen --no-dev --python 3.11 \
- && uv pip uninstall \
-        triton \
-        nvidia-nccl-cu12 \
-        nvidia-cufft-cu12 \
-        nvidia-curand-cu12 \
-        nvidia-nvshmem-cu12 \
-        nvidia-cuda-cupti-cu12 \
-        nvidia-nvtx-cu12 \
+ && uv pip uninstall triton \
  && find /app/.venv -depth -type d -name '__pycache__' -exec rm -rf {} + \
  && find /app/.venv -depth -type d -name 'tests' -exec rm -rf {} + \
  && find /app/.venv -type f -name '*.pyc' -delete
@@ -63,6 +57,15 @@ COPY main.py manage.py README.md ./
 COPY docker/supervisord.conf /etc/supervisor/conf.d/detector.conf
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Build identity, exposed at GET /. Stamped AFTER the COPY layers so any
+# code/config change busts the cache and the timestamp refreshes; if nothing
+# changed the cache hits and the stamp stays the same (correct: no deploy
+# happened). Pass --build-arg GIT_SHA=$(git rev-parse --short HEAD) from
+# your build command to embed the commit too.
+ARG GIT_SHA=unknown
+ENV BUILD_GIT_SHA=$GIT_SHA
+RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILD_TIME
 
 ENV DJANGO_SETTINGS_MODULE=detector.settings \
     ALLOWED_HOSTS=* \

@@ -335,20 +335,28 @@ def sport_prompt_detail(request, slug: str):
 @extend_schema(
     summary="Poll one or more OCR job statuses",
     description=(
-        "Pass `ids` as a repeated query param OR a comma-separated list. "
+        "GET with `ids` as a repeated query param OR comma-separated list, "
+        "OR POST with `{ ids: [...] }` body (use POST when the ID list is "
+        "large enough to overflow request-line limits ~4KB). "
         "Returns `{ jobs: { <id>: { status, result?, error? } } }`. "
         "Statuses: queued, started, finished, failed, deferred, canceled, "
         "unknown (TTL expired), unavailable (Redis down)."
     ),
 )
-@api_view(["GET"])
+@api_view(["GET", "POST"])
 def ocr_jobs_status(request):
-    raw = request.GET.getlist("ids") or []
-    # Support both repeated ?ids=a&ids=b and ?ids=a,b shapes — the frontend
-    # default for arrays in URLSearchParams varies, this side accepts either.
     flat: list[str] = []
-    for item in raw:
-        flat.extend(part.strip() for part in item.split(",") if part.strip())
+    if request.method == "POST":
+        body_ids = request.data.get("ids") if hasattr(request, "data") else None
+        if isinstance(body_ids, list):
+            flat = [str(i).strip() for i in body_ids if str(i).strip()]
+        elif isinstance(body_ids, str):
+            flat = [p.strip() for p in body_ids.split(",") if p.strip()]
+    else:
+        # Support both repeated ?ids=a&ids=b and ?ids=a,b shapes — the frontend
+        # default for arrays in URLSearchParams varies, this side accepts either.
+        for item in request.GET.getlist("ids") or []:
+            flat.extend(part.strip() for part in item.split(",") if part.strip())
 
     if not flat:
         return Response({"jobs": {}})
