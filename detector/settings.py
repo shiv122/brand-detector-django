@@ -194,6 +194,26 @@ LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS = float(
     os.getenv("LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS", "180")
 )
 LOCAL_OCR_MAX_NEW_TOKENS = int(os.getenv("LOCAL_OCR_MAX_NEW_TOKENS", "2048"))
+# Robustness knobs for the Ollama call. Defaults are conservative for a
+# single-GPU Ollama serving one request at a time (OLLAMA_NUM_PARALLEL=1).
+#   MAX_CONCURRENT      — cluster-wide cap on in-flight calls. Set to ~the
+#                         actual parallelism the model can serve.
+#   SLOT_TIMEOUT        — how long a worker is willing to wait for a slot
+#                         before failing the job (still re-tryable upstream).
+#   RETRIES             — how many times to retry a single HTTP call on
+#                         timeout / 429 / 5xx, with exponential backoff.
+#   RETRY_BASE_DELAY    — base delay (seconds); doubles each attempt with
+#                         up to 30% jitter.
+LOCAL_OCR_OLLAMA_MAX_CONCURRENT = int(
+    os.getenv("LOCAL_OCR_OLLAMA_MAX_CONCURRENT", "2")
+)
+LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS = float(
+    os.getenv("LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS", "300")
+)
+LOCAL_OCR_OLLAMA_RETRIES = int(os.getenv("LOCAL_OCR_OLLAMA_RETRIES", "3"))
+LOCAL_OCR_OLLAMA_RETRY_BASE_DELAY = float(
+    os.getenv("LOCAL_OCR_OLLAMA_RETRY_BASE_DELAY", "1.0")
+)
 LOCAL_OCR_EXTRACT_PROMPT = os.getenv(
     "LOCAL_OCR_EXTRACT_PROMPT",
     "Extract all visible text from this image, preserving the original "

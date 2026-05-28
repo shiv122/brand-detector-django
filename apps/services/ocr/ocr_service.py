@@ -272,9 +272,29 @@ class OcrService:
                 f"image={len(image_data)} bytes"
             )
 
-        extracted_text, ocr_timing = engine.extract_text(
-            image_data, self.config.local_ocr_extract_prompt
-        )
+        # Bound the number of concurrent calls into Ollama across ALL RQ
+        # workers via a Redis counter — Ollama serves one request at a
+        # time per model (OLLAMA_NUM_PARALLEL=1), so without this limit
+        # 12 workers race against 1 slot, latency collapses, and the
+        # queue stalls. The slot is held only across the HTTP call.
+        from apps.services.ocr.ocr_concurrency import ollama_slot
+
+        try:
+            with ollama_slot():
+                extracted_text, ocr_timing = engine.extract_text(
+                    image_data, self.config.local_ocr_extract_prompt
+                )
+        except TimeoutError as e:
+            # No Ollama capacity within the wait budget — surface this as a
+            # clean failure rather than letting the worker hang. The frontend
+            # will see it as a failed job and stop polling that ID.
+            if debug:
+                print(f"[OCR/Local] slot timeout: {e}")
+            return {
+                "error": str(e),
+                "prompt": prompt,
+                "glm_timing": {"glm_ocr_backend": "ollama", "slot_timeout": True},
+            }
         glm_timing: Dict[str, Any] = {
             "glm_ocr_load": ocr_timing.get("load_ms", 0),
             "glm_ocr_inference": ocr_timing.get("inference_ms", 0),

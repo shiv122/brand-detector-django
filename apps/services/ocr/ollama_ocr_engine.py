@@ -11,10 +11,33 @@ separate process that holds the weights and serves them over HTTP.
 from __future__ import annotations
 
 import base64
+import logging
+import os
+import random
 import time
 from typing import Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
+
+# Status codes worth retrying. 429 = Ollama saying "busy"; 5xx = transient
+# server errors. Other 4xx bodies are permanent — retrying just wastes budget.
+_RETRY_STATUSES: frozenset[int] = frozenset({429, 502, 503, 504})
+
+
+def _retry_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("LOCAL_OCR_OLLAMA_RETRIES", "3")))
+    except ValueError:
+        return 3
+
+
+def _retry_base_delay() -> float:
+    try:
+        return max(0.1, float(os.environ.get("LOCAL_OCR_OLLAMA_RETRY_BASE_DELAY", "1.0")))
+    except ValueError:
+        return 1.0
 
 
 class OllamaOcrEngine:
@@ -68,20 +91,60 @@ class OllamaOcrEngine:
             },
         }
 
+        # Retry with exponential backoff on transient failures (timeouts,
+        # connection drops, 429/5xx). A non-retryable HTTP error short-
+        # circuits the loop. Total time can exceed timeout_seconds × attempts
+        # in the worst case; the caller is expected to bound this via the
+        # cross-worker semaphore (`ocr_concurrency.ollama_slot`).
+        attempts = _retry_attempts()
+        base_delay = _retry_base_delay()
+        resp = None
+        last_exc: Optional[BaseException] = None
         t0 = time.perf_counter()
-        try:
-            resp = requests.post(url, json=body, timeout=self.timeout_seconds)
-        except requests.RequestException as e:
-            self._last_error = (
-                f"Could not reach Ollama at {self.host} — is `ollama serve` "
-                f"running? {e}"
-            )
-            return None, {"load_ms": 0, "inference_ms": 0, "network_ms": 0}
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = requests.post(url, json=body, timeout=self.timeout_seconds)
+            except requests.Timeout as e:
+                last_exc = e
+                logger.warning(
+                    "Ollama timeout host=%s model=%s attempt=%d/%d timeout=%.0fs",
+                    self.host, self.model, attempt, attempts, self.timeout_seconds,
+                )
+            except requests.RequestException as e:
+                last_exc = e
+                logger.warning(
+                    "Ollama connect error host=%s model=%s attempt=%d/%d: %s",
+                    self.host, self.model, attempt, attempts, e,
+                )
+            else:
+                # Got a response — retry only on transient HTTP statuses.
+                if resp.ok or resp.status_code not in _RETRY_STATUSES:
+                    break
+                logger.warning(
+                    "Ollama %s host=%s attempt=%d/%d body=%s",
+                    resp.status_code, self.host, attempt, attempts, resp.text[:200],
+                )
+
+            # Don't sleep after the last attempt.
+            if attempt < attempts:
+                # Exponential backoff with jitter: 1s → 2s → 4s (+up to 30%).
+                delay = base_delay * (2 ** (attempt - 1))
+                delay *= 1.0 + random.uniform(0, 0.3)
+                time.sleep(delay)
+
         network_ms = int((time.perf_counter() - t0) * 1000)
+
+        if resp is None:
+            # All attempts threw a network-level exception.
+            self._last_error = (
+                f"Ollama unreachable at {self.host} after {attempts} attempts "
+                f"({network_ms}ms total): {last_exc}"
+            )
+            return None, {"load_ms": 0, "inference_ms": 0, "network_ms": network_ms}
 
         if not resp.ok:
             self._last_error = (
-                f"Ollama {resp.status_code}: {resp.text[:300]}"
+                f"Ollama {resp.status_code} after {attempts} attempts: {resp.text[:300]}"
             )
             return None, {
                 "load_ms": 0,

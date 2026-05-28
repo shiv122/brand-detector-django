@@ -13,9 +13,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/app/.venv/bin:/root/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 # libgl/libglib for opencv-python, libgomp for torch/ultralytics, redis +
-# supervisor + tini for the runtime, curl + ca-certs to install uv.
+# supervisor + tini for the runtime, curl + ca-certs to install uv, zstd to
+# unpack the Ollama release tarball.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl tini supervisor redis-server \
+        ca-certificates curl tini supervisor redis-server zstd \
         libgl1 libglib2.0-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -23,6 +24,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && ln -sf /root/.local/bin/uv /usr/local/bin/uv \
     && ln -sf /root/.local/bin/uvx /usr/local/bin/uvx
+
+# Ollama (the engine that serves the glm-ocr vision model). Installed from
+# the GitHub release tarball — avoids the systemd unit the upstream
+# installer would otherwise wire up.
+ARG OLLAMA_VERSION=v0.24.0
+RUN curl -fsSL "https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-amd64.tar.zst" \
+        -o /tmp/ollama.tar.zst \
+    && zstd -d /tmp/ollama.tar.zst -o /tmp/ollama.tar \
+    && tar -C /usr -xf /tmp/ollama.tar \
+    && rm /tmp/ollama.tar /tmp/ollama.tar.zst \
+    && ollama --version
+
+# Bake the glm-ocr model into the image so cold starts on vast.ai don't
+# have to pull ~10GB from the Ollama registry. Mirrors the GLM_OCR/Dockerfile
+# build step: spin Ollama up on loopback, pull the model, stop it. The
+# downloaded blobs live in /root/.ollama and the supervisord ollama program
+# picks them up at runtime.
+ENV OLLAMA_MODELS=/root/.ollama/models \
+    OLLAMA_KEEP_ALIVE=24h \
+    OLLAMA_NUM_PARALLEL=1
+RUN set -eux; \
+    OLLAMA_HOST=127.0.0.1:11434 ollama serve > /tmp/ollama-build.log 2>&1 & \
+    pid=$!; \
+    for i in $(seq 1 30); do \
+        if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then break; fi; \
+        sleep 1; \
+    done; \
+    OLLAMA_HOST=127.0.0.1:11434 ollama pull glm-ocr; \
+    OLLAMA_HOST=127.0.0.1:11434 ollama list; \
+    kill $pid; wait $pid 2>/dev/null || true
 
 WORKDIR /app
 
@@ -71,13 +102,17 @@ ENV DJANGO_SETTINGS_MODULE=detector.settings \
     ALLOWED_HOSTS=* \
     DEBUG=False \
     OCR_PROVIDER=local \
-    LOCAL_OCR_OLLAMA_HOST=http://glm-ocr:11434 \
+    LOCAL_OCR_OLLAMA_HOST=http://127.0.0.1:11434 \
     LOCAL_OCR_OLLAMA_MODEL=glm-ocr \
     LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS=180 \
     REDIS_URL=redis://127.0.0.1:6379/0 \
     PORT=8000 \
     WEB_CONCURRENCY=2 \
-    RQ_WORKERS=12
+    RQ_WORKERS=12 \
+    LOCAL_OCR_OLLAMA_MAX_CONCURRENT=2 \
+    LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS=300 \
+    LOCAL_OCR_OLLAMA_RETRIES=3 \
+    LOCAL_OCR_OLLAMA_RETRY_BASE_DELAY=1.0
 
 EXPOSE 8000
 
