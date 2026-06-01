@@ -34,8 +34,13 @@ class AppConfig:
         self.local_ocr_ollama_model: str = getattr(
             settings, "LOCAL_OCR_OLLAMA_MODEL", "glm-ocr"
         )
+        # Per-call ceiling for one Ollama request. Kept below the RQ job
+        # timeout even after retries: timeout x retries (120 x 3 = 360s) plus
+        # the slot wait (150s) plus the format call (~60s) must fit inside
+        # RQ_OCR_TIMEOUT (600s). Warm calls finish in seconds; this only bites
+        # on a cold/stuck model, where failing and retrying is the right move.
         self.local_ocr_ollama_timeout_seconds: float = float(
-            getattr(settings, "LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS", 180)
+            getattr(settings, "LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS", 120)
         )
         self.local_ocr_max_new_tokens: int = int(
             getattr(settings, "LOCAL_OCR_MAX_NEW_TOKENS", 2048)

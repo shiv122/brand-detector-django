@@ -249,11 +249,19 @@ GEMINI_TEXT_TEMPERATURE = float(os.getenv("GEMINI_TEXT_TEMPERATURE", "0.0"))
 # frontend gets detections back instantly and OCR results stream in once
 # the worker picks them up.
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+# Timeout budget (must stay internally consistent — see ocr_concurrency.py):
+#   DEFAULT_TIMEOUT (job)  >  slot-wait  +  ollama(timeout x retries)  +  format
+#   600                    >  150        +  120 x 3 (=360)             +  60   = 570
+# If a job exceeds DEFAULT_TIMEOUT, RQ kills it (death penalty) — keep this the
+# *outermost* bound so the slot limiter's own TimeoutError fires first and the
+# job ends cleanly (and gets retried) instead of being killed mid-flight.
+# RESULT_TTL is generous so a long video's early results survive in Redis until
+# the frontend polls them (the durable copy still lives on Frame.ocr_summary).
 RQ_QUEUES = {
     "ocr": {
         "URL": REDIS_URL,
-        "DEFAULT_TIMEOUT": int(os.getenv("RQ_OCR_TIMEOUT", "180")),
-        "RESULT_TTL": int(os.getenv("RQ_RESULT_TTL", "3600")),
+        "DEFAULT_TIMEOUT": int(os.getenv("RQ_OCR_TIMEOUT", "600")),
+        "RESULT_TTL": int(os.getenv("RQ_RESULT_TTL", "7200")),
         "FAILURE_TTL": int(os.getenv("RQ_FAILURE_TTL", "3600")),
     },
 }

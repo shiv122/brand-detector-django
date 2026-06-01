@@ -46,14 +46,19 @@ def _max_concurrent() -> int:
 
 
 def _acquire_timeout() -> float:
-    """Maximum time a worker is willing to wait for a slot before giving up
-    on a job. Default 5 min — longer than expected per-call latency but
-    short enough that the RQ job-timeout (180s default) catches truly stuck
-    workers via its own path."""
+    """Maximum time a worker is willing to wait for a slot before giving up.
+
+    MUST be strictly less than the RQ job timeout (RQ_OCR_TIMEOUT, default
+    600s). Previously this defaulted to 300s while the job timeout was 180s —
+    so a job waiting for a slot was killed by RQ (death penalty) before it
+    could raise its own clean TimeoutError, leaving the slot/limiter state
+    ragged and the failure un-retryable. With the default at 150s the limiter
+    times out first: the job ends cleanly and (via rq.Retry) is requeued to
+    try again once the backlog drains."""
     try:
-        return float(os.environ.get("LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS", "300"))
+        return float(os.environ.get("LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS", "150"))
     except ValueError:
-        return 300.0
+        return 150.0
 
 
 @contextmanager

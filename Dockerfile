@@ -32,19 +32,30 @@ ARG GIT_SHA=unknown
 ENV BUILD_GIT_SHA=$GIT_SHA
 RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILD_TIME
 
+# OCR / queue tuning. The timeout budget MUST stay ordered so a stalled job
+# fails CLEANLY (and retries) instead of being killed mid-flight:
+#   slot wait (150) < ollama x retries (120*3=360) + slot + format < RQ job (600)
+# OLLAMA_NUM_PARALLEL / MAX_CONCURRENT / RQ_WORKERS are the throughput knobs —
+# raise them only if the GPU has VRAM headroom (the vision model is large).
 ENV DJANGO_SETTINGS_MODULE=detector.settings \
     ALLOWED_HOSTS=* \
     DEBUG=False \
     OCR_PROVIDER=local \
     LOCAL_OCR_OLLAMA_HOST=http://127.0.0.1:11434 \
     LOCAL_OCR_OLLAMA_MODEL=glm-ocr \
-    LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS=180 \
+    LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS=120 \
     REDIS_URL=redis://127.0.0.1:6379/0 \
     PORT=8000 \
-    WEB_CONCURRENCY=2 \
+    WEB_CONCURRENCY=4 \
+    GUNICORN_TIMEOUT=3600 \
     RQ_WORKERS=12 \
-    LOCAL_OCR_OLLAMA_MAX_CONCURRENT=2 \
-    LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS=300 \
+    RQ_OCR_TIMEOUT=600 \
+    RQ_RESULT_TTL=7200 \
+    RQ_FAILURE_TTL=3600 \
+    RQ_OCR_JOB_RETRIES=3 \
+    OLLAMA_NUM_PARALLEL=2 \
+    LOCAL_OCR_OLLAMA_MAX_CONCURRENT=3 \
+    LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS=150 \
     LOCAL_OCR_OLLAMA_RETRIES=3 \
     LOCAL_OCR_OLLAMA_RETRY_BASE_DELAY=1.0
 
