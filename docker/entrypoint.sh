@@ -17,7 +17,7 @@ python manage.py collectstatic --noinput >/dev/null 2>&1 || true
 # config is invalid rather than crash-looping under supervisord.
 echo "[entrypoint] rendering nginx config (listen ${PORT})..."
 sed "s/__PORT__/${PORT}/g" /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
-nginx -t -c /etc/nginx/nginx.conf
+/usr/sbin/nginx -t -c /etc/nginx/nginx.conf
 
 echo "[entrypoint] starting supervisord (rqworker, gunicorn, nginx)..."
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/detector.conf
