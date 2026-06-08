@@ -92,6 +92,16 @@ RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILD_TIME
 #   - no DATABASE_URL  -> falls back to sqlite (local dev only)
 #   - GLM_OCR_HOST     -> the external GLM OCR box (its own GPU)
 #   - RQ_WORKERS       -> bounds concurrent OCR calls into the GLM box
+#
+# CPU detection tuning (no GPU) — sized for an 8 vCPU / 32 GB host:
+#   YOLO inference runs on CPU and parallelises via OpenMP/MKL threads. To get
+#   fast detection WITHOUT oversubscribing the 8 cores, we run 2 gunicorn
+#   workers each pinned to 4 inference threads (2 x 4 = 8). That serves up to 2
+#   concurrent video streams at full speed; a 3rd queues rather than thrashing.
+#   Each worker preloads the YOLO weights (~4-5 GB RSS), so 2 workers ~= 10 GB —
+#   well within 32 GB. For ABSOLUTE single-video speed set WEB_CONCURRENCY=1 +
+#   OMP_NUM_THREADS=8 (one stream uses all 8 cores). The *_NUM_THREADS vars must
+#   be process env (set here) because torch reads them at import.
 ENV DJANGO_SETTINGS_MODULE=detector.settings \
     ALLOWED_HOSTS=* \
     DEBUG=False \
@@ -104,9 +114,12 @@ ENV DJANGO_SETTINGS_MODULE=detector.settings \
     REDIS_URL=redis://redis:6379/0 \
     PORT=8000 \
     GUNICORN_PORT=8001 \
-    WEB_CONCURRENCY=4 \
+    WEB_CONCURRENCY=2 \
     GUNICORN_THREADS=8 \
     GUNICORN_TIMEOUT=3600 \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    OPENBLAS_NUM_THREADS=4 \
     RQ_WORKERS=4 \
     RQ_OCR_TIMEOUT=600 \
     RQ_RESULT_TTL=7200 \
