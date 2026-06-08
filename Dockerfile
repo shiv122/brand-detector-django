@@ -43,8 +43,9 @@ WORKDIR /app
 
 # Python deps. The uv cache lives in a buildkit cache mount (not in the image
 # layer) so peak disk during install stays low and wheels never bloat the
-# image. psycopg2-binary (Postgres / DATABASE_URL) and boto3 (DigitalOcean
-# Spaces uploads) are runtime-only extras added on top of the locked set.
+# image. psycopg2-binary (Postgres), PyMySQL (MySQL/MariaDB — pure-python, no
+# system libs) and boto3 (DigitalOcean Spaces) are runtime-only extras added
+# on top of the locked set; the active DB driver is picked by DATABASE_URL.
 #
 # triton is stripped: it's the lone pure-python compile-time dep YOLO inference
 # never touches. Every other CUDA wheel (cudnn, cublas, nccl, ...) IS linked or
@@ -52,7 +53,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --frozen --no-dev --python 3.11 \
- && uv pip install --python /app/.venv/bin/python psycopg2-binary==2.9.9 boto3==1.34.162 \
+ && uv pip install --python /app/.venv/bin/python psycopg2-binary==2.9.9 PyMySQL==1.1.1 boto3==1.34.162 \
  && uv pip uninstall triton \
  && find /app/.venv -depth -type d -name '__pycache__' -exec rm -rf {} + \
  && find /app/.venv -depth -type d -name 'tests' -exec rm -rf {} + \

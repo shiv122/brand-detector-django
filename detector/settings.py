@@ -73,26 +73,48 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "detector.wsgi.application"
 
-# Database — external Postgres in production (Coolify) via DATABASE_URL,
-# falling back to sqlite for local dev when DATABASE_URL is unset. Postgres
-# needs the psycopg2 driver (declared in pyproject) at runtime; sqlite needs
-# nothing, so `manage.py check` works locally without it.
+# Database — external Postgres OR MySQL/MariaDB in production (Coolify) via
+# DATABASE_URL, falling back to sqlite for local dev when DATABASE_URL is unset.
+# The engine is chosen from the URL scheme:
+#   postgres:// | postgresql://   -> Postgres   (needs psycopg2, in the image)
+#   mysql://    | mariadb://      -> MySQL       (needs PyMySQL, in the image)
+# sqlite needs nothing, so `manage.py check` works locally without a driver.
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if DATABASE_URL:
     from urllib.parse import urlparse, unquote
 
     _db = urlparse(DATABASE_URL)
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": _db.path.lstrip("/"),
-            "USER": unquote(_db.username) if _db.username else "",
-            "PASSWORD": unquote(_db.password) if _db.password else "",
-            "HOST": _db.hostname or "",
-            "PORT": str(_db.port or ""),
-            "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "60")),
-        }
+    # Allow an explicit driver suffix too, e.g. mysql+pymysql://...
+    _scheme = _db.scheme.split("+", 1)[0].lower()
+    _ENGINES = {
+        "postgres": "django.db.backends.postgresql",
+        "postgresql": "django.db.backends.postgresql",
+        "mysql": "django.db.backends.mysql",
+        "mariadb": "django.db.backends.mysql",
     }
+    _engine = _ENGINES.get(_scheme, "django.db.backends.postgresql")
+
+    _db_config = {
+        "ENGINE": _engine,
+        "NAME": unquote(_db.path.lstrip("/")),
+        "USER": unquote(_db.username) if _db.username else "",
+        "PASSWORD": unquote(_db.password) if _db.password else "",
+        "HOST": _db.hostname or "",
+        "PORT": str(_db.port or ""),
+        "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "60")),
+    }
+
+    if _engine == "django.db.backends.mysql":
+        # PyMySQL is a pure-python MySQL driver (no system libs to build).
+        # Register it as MySQLdb and spoof a version new enough for Django's
+        # mysqlclient >= 1.4.3 check.
+        import pymysql
+
+        pymysql.version_info = (1, 4, 6, "final", 0)
+        pymysql.install_as_MySQLdb()
+        _db_config["OPTIONS"] = {"charset": "utf8mb4"}
+
+    DATABASES = {"default": _db_config}
 else:
     DATABASES = {
         "default": {
