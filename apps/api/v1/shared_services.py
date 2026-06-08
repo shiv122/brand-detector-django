@@ -20,9 +20,9 @@ _counting_service = CountingService()
 # Frames are uploaded to DigitalOcean Spaces; the public URL is what OCR and
 # the dashboard use.
 _spaces_service = SpacesService(_config)
-# OCR is no longer part of the detection path — it runs on-demand as an
-# external GLM OCR call (see apps/services/ocr). Kept here for the OCR
-# controller + RQ task to share one instance.
+# Shared OCR service: used on-demand by the OCR controller + RQ task, and
+# (when enabled per request) by the detection path to OCR each frame during
+# video processing.
 _ocr_service = OcrService(_config)
 _detection_service = DetectionService(
     _config,
@@ -31,5 +31,6 @@ _detection_service = DetectionService(
     _classification_service,
     _counting_service,
     _spaces_service,
+    _ocr_service,
 )
 

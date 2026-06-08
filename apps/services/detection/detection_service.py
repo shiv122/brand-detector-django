@@ -22,9 +22,17 @@ from apps.services.model.model_service import ModelService, DetectionResult
 from apps.services.image.image_service import ImageService
 from apps.services.classification.classification_service import ClassificationService
 from apps.services.counting.counting_service import CountingService
-from apps.core.models import ProcessingSession, Frame, Detection, Classification
+from apps.core.models import (
+    ProcessingSession,
+    Frame,
+    Detection,
+    Classification,
+    SportPrompt,
+)
 from apps.core.enums import ProcessingStatus
 from apps.utils.file_helpers import ensure_directory_exists
+from apps.services.ocr.ocr_queue import enqueue_ocr_job
+from apps.utils.prompt_render import render_prompt
 
 import requests
 
@@ -40,6 +48,7 @@ class DetectionService:
         classification_service: Optional[ClassificationService] = None,
         counting_service: Optional[CountingService] = None,
         spaces_service=None,
+        ocr_service=None,
     ):
         self.config = config
         self.model_service = model_service
@@ -47,6 +56,7 @@ class DetectionService:
         self.classification_service = classification_service
         self.counting_service = counting_service
         self.spaces_service = spaces_service
+        self.ocr_service = ocr_service
         self.csv_dir = Path(self.config.static_dir) / "csv_reports"
 
         # Ensure directories exist
@@ -149,6 +159,59 @@ class DetectionService:
         else:
             cv2.imwrite(str(frame_path), annotated_frame)
         return f"/static/frames/{frame_filename}", "", str(frame_path)
+
+    def _resolve_ocr_prompt(
+        self, source: Optional[dict]
+    ) -> Optional[Tuple[str, dict]]:
+        """Resolve an OCR prompt + metadata from the validated request data.
+
+        Returns (prompt_text, prompt_meta) or None when no OCR is requested
+        / no matching prompt can be found. Priority: inline `prompt` >
+        `prompt_slug` > `sport`.
+        """
+        if not source:
+            return None
+        inline = (source.get("prompt") or "").strip()
+        slug = (source.get("prompt_slug") or "").strip()
+        sport = (source.get("sport") or "").strip()
+
+        if inline:
+            return render_prompt(inline, []), {"source": "inline"}
+
+        if slug:
+            sp = SportPrompt.objects.filter(slug=slug).first()
+            if sp is not None:
+                brands = list(sp.allowed_brands or [])
+                meta = {
+                    "source": "stored",
+                    "slug": sp.slug,
+                    "name": sp.name,
+                    "sport": sp.sport,
+                }
+                if brands:
+                    meta["allowed_brands"] = brands
+                return render_prompt(sp.prompt, brands), meta
+
+        if sport:
+            sport_lower = sport.lower()
+            sp = (
+                SportPrompt.objects.filter(slug=sport_lower).first()
+                or SportPrompt.objects.filter(sport__iexact=sport_lower)
+                .order_by("-updated_at")
+                .first()
+            )
+            if sp is not None:
+                brands = list(sp.allowed_brands or [])
+                meta = {
+                    "source": "sport",
+                    "slug": sp.slug,
+                    "name": sp.name,
+                    "sport": sp.sport,
+                }
+                if brands:
+                    meta["allowed_brands"] = brands
+                return render_prompt(sp.prompt, brands), meta
+        return None
 
     def update_config(self, data: dict) -> Response:
         """Update configuration (data is already validated)"""
@@ -261,30 +324,27 @@ class DetectionService:
         self, request, validated_data: dict = None
     ) -> StreamingHttpResponse:
         """Handle video detection request with SSE streaming (data is already validated)"""
-        if validated_data is not None:
-            file_url = validated_data.get("file_url")
-            frames_per_second = int(validated_data.get("frames_per_second", 2))
-            confidence_threshold = float(
-                validated_data.get("confidence_threshold", 0.5)
-            )
-            create_video = validated_data.get("create_video", False)
-            enable_classification = validated_data.get("enable_classification", False)
-            weight_name = validated_data.get("weight_name")
-            classification_weight_name = validated_data.get("classification_weight_name")
-        else:
-            file_url = request.data.get("file_url")
-            frames_per_second = int(request.data.get("frames_per_second", 2))
-            confidence_threshold = float(request.data.get("confidence_threshold", 0.5))
-            create_video = request.data.get("create_video", False)
-            enable_classification = request.data.get("enable_classification", False)
-            weight_name = request.data.get("weight_name")
-            classification_weight_name = request.data.get("classification_weight_name")
+        source = validated_data if validated_data is not None else request.data
+        file_url = source.get("file_url")
+        frames_per_second = int(source.get("frames_per_second", 2))
+        confidence_threshold = float(source.get("confidence_threshold", 0.5))
+        create_video = source.get("create_video", False)
+        enable_classification = source.get("enable_classification", False)
+        weight_name = source.get("weight_name")
+        classification_weight_name = source.get("classification_weight_name")
+        enable_ocr = bool(source.get("enable_ocr", False))
 
         if not weight_name and not self.is_model_loaded():
             return Response(
                 {"error": "Model not loaded"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+        # Resolve the OCR prompt once for the whole video; the per-frame loop
+        # reuses it. None means OCR is off (toggle disabled or no prompt found).
+        ocr_resolution = (
+            self._resolve_ocr_prompt(source) if enable_ocr else None
+        )
 
         file = request.FILES.get("file")
 
@@ -299,6 +359,7 @@ class DetectionService:
                     enable_classification,
                     weight_name,
                     classification_weight_name,
+                    ocr_resolution,
                 ),
                 content_type="text/event-stream",
             )
@@ -313,6 +374,7 @@ class DetectionService:
                     enable_classification,
                     weight_name,
                     classification_weight_name,
+                    ocr_resolution,
                 ),
                 content_type="text/event-stream",
             )
@@ -331,6 +393,7 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
+        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Stream video processing from URL with SSE"""
         video_path = None
@@ -430,6 +493,7 @@ class DetectionService:
                 enable_classification,
                 weight_name,
                 classification_weight_name,
+                ocr_resolution,
             ):
                 yield event
 
@@ -457,6 +521,7 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
+        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Stream video processing with SSE"""
         video_path = None
@@ -488,6 +553,7 @@ class DetectionService:
                 enable_classification,
                 weight_name,
                 classification_weight_name,
+                ocr_resolution,
             ):
                 yield event
 
@@ -510,11 +576,20 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
+        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Process video and stream results via SSE"""
+        # OCR runs per-frame only when the request opted in (resolved prompt)
+        # and the external GLM OCR endpoint is configured.
+        ocr_active = bool(
+            ocr_resolution
+            and self.ocr_service
+            and self.ocr_service.is_available()
+        )
         # Prepare settings in JSON format
         settings = {
             "enable_classification": enable_classification,
+            "enable_ocr": ocr_active,
             "create_video": create_video,
             "model_weight": weight_name or self.get_current_weight(),
         }
@@ -681,6 +756,35 @@ class DetectionService:
                         # Store for video creation
                         detection_results[frame_count] = (detections, annotated_frame)
 
+                        # Enqueue OCR for this frame if the user opted in. OCR
+                        # the ORIGINAL un-annotated `frame` (full resolution) —
+                        # the annotated frame has bbox rectangles + class labels
+                        # burned in, which OCR would mis-read as text. Upload it
+                        # to Spaces so the external GLM box can fetch it by URL.
+                        ocr_job_info: Optional[dict] = None
+                        if ocr_active:
+                            prompt, meta = ocr_resolution
+                            ok_raw, raw_buf = cv2.imencode(".jpg", frame)
+                            raw_bytes = raw_buf.tobytes() if ok_raw else b""
+                            ocr_url, _, _ = self._store_frame_image(
+                                f"ocr_{frame_filename}", raw_bytes, frame
+                            )
+                            if ocr_url.startswith(("http://", "https://")):
+                                ocr_job_info = enqueue_ocr_job(
+                                    image_url=ocr_url,
+                                    prompt=prompt,
+                                    prompt_meta=meta,
+                                    frame_id=db_frame.id,
+                                )
+                            else:
+                                # No public URL (Spaces unconfigured) — GLM can't
+                                # fetch a local path, so surface it rather than
+                                # silently dropping the OCR request.
+                                ocr_job_info = {
+                                    "status": "unavailable",
+                                    "error": "Spaces not configured; OCR needs a public frame URL.",
+                                }
+
                         # Stream frame data via SSE (minimal data - no large session_summary)
                         frame_data = {
                             "type": "frame",
@@ -692,6 +796,8 @@ class DetectionService:
                             "timestamp": timestamp,
                             "logo_counts": frame_logo_counts,
                         }
+                        if ocr_job_info is not None:
+                            frame_data["ocr_job"] = ocr_job_info
                         yield f"data: {json.dumps(frame_data)}\n\n"
 
                         # Send session summary only every 10 frames to reduce data size

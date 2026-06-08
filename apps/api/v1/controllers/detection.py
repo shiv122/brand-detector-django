@@ -237,6 +237,23 @@ def detect_images(request):
                     "default": False,
                     "description": "Whether to enable logo classification",
                 },
+                "enable_ocr": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "OCR each processed frame via the external GLM endpoint. Requires Spaces configured.",
+                },
+                "sport": {
+                    "type": "string",
+                    "description": "Sport name; resolves to the saved OCR prompt for that sport (used when enable_ocr is true).",
+                },
+                "prompt_slug": {
+                    "type": "string",
+                    "description": "Slug of a saved SportPrompt to use for OCR (overrides sport).",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Inline OCR prompt (overrides prompt_slug / sport).",
+                },
             },
         }
     },

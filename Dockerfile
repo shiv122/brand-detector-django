@@ -1,32 +1,71 @@
-# Application image — thin layer on top of the heavy base.
+# Detector backend — single image: detection (YOLO/torch) + Django API + the
+# RQ worker that runs OCR jobs by calling the EXTERNAL GLM OCR box over HTTP.
 #
-# The base image (root200/detector-base:vX) holds CUDA + the entire Python
-# venv + the Ollama binary + YOLO weights. Those rarely change, so we pin
-# a tagged base and only rebuild this image when code/config changes. Net
-# result: every iteration push is ~5 MB instead of 11 GB.
+# Three processes run under supervisord (see docker/supervisord.conf):
+#   - rqworker  — OCR jobs (HTTP calls to GLM_OCR_HOST; no GPU/Ollama here)
+#   - gunicorn  — app/API + SSE, loopback only
+#   - nginx     — the only public process; serves /static/ + proxies to gunicorn
 #
-# Bump the FROM tag when Dockerfile.base is rebuilt for new deps or weights.
+# Redis (queue) and Postgres (DB) are EXTERNAL services reached via REDIS_URL /
+# DATABASE_URL; GLM OCR is an external HTTP API (GLM_OCR_HOST). Nothing
+# data-bearing is baked into this image.
+#
+# Build + push (Coolify builds this directly; this is for manual pushes):
+#   docker buildx build --platform linux/amd64 \
+#       -t root200/detector-backend:latest \
+#       --build-arg GIT_SHA=$(git rev-parse --short HEAD) --push .
 
-FROM root200/detector-base:v1
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    PATH=/app/.venv/bin:/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# System deps:
+#   libgl1/libglib2.0-0 — opencv-python   libgomp1 — torch/ultralytics
+#   tini/supervisor      — process mgmt    curl/ca-certificates — install uv
+#   nginx                — public reverse proxy + /static/ file serving
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl tini supervisor \
+        libgl1 libglib2.0-0 libgomp1 nginx \
+    && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
+
+# uv (manages the venv).
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && ln -sf /root/.local/bin/uv /usr/local/bin/uv \
+    && ln -sf /root/.local/bin/uvx /usr/local/bin/uvx
 
 WORKDIR /app
 
-# nginx — fronts Gunicorn and serves /static/ (frames, videos, csv) off disk
-# so image bytes never occupy a Python worker. Kept in this thin layer (not
-# the base) for now; it's a stable ~6 MB layer that ships once and caches. On
-# the next base rebuild, move this apt line into Dockerfile.base.
-RUN apt-get update && apt-get install -y --no-install-recommends nginx \
-    && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
+# Python deps. The uv cache lives in a buildkit cache mount (not in the image
+# layer) so peak disk during install stays low and wheels never bloat the
+# image. psycopg2-binary (Postgres / DATABASE_URL) and boto3 (DigitalOcean
+# Spaces uploads) are runtime-only extras added on top of the locked set.
+#
+# triton is stripped: it's the lone pure-python compile-time dep YOLO inference
+# never touches. Every other CUDA wheel (cudnn, cublas, nccl, ...) IS linked or
+# dlopen'd from torch._C, so stripping any of those breaks `import torch`.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --frozen --no-dev --python 3.11 \
+ && uv pip install --python /app/.venv/bin/python psycopg2-binary==2.9.9 boto3==1.34.162 \
+ && uv pip uninstall triton \
+ && find /app/.venv -depth -type d -name '__pycache__' -exec rm -rf {} + \
+ && find /app/.venv -depth -type d -name 'tests' -exec rm -rf {} + \
+ && find /app/.venv -type f -name '*.pyc' -delete
+
+# YOLO weights baked in so detection works offline.
+COPY weights/ ./weights/
+
+# nginx config template — entrypoint renders the listen port ($PORT) into it.
 COPY docker/nginx.conf /etc/nginx/nginx.conf.template
 
-# Runtime deps added to the base venv here (so we don't rebuild the 11 GB base
-# just to add them): psycopg2 for Postgres (DATABASE_URL), boto3 for uploading
-# frames to DigitalOcean Spaces. Fold into Dockerfile.base on the next rebuild.
-RUN uv pip install --python /app/.venv/bin/python --no-cache \
-        psycopg2-binary==2.9.9 boto3==1.34.162
-
-# App code (changes most often; keep these COPYs late so the BUILD_TIME
-# stamp below auto-busts whenever any of them changes).
+# App code (changes most often; keep these COPYs late so the BUILD_TIME stamp
+# below auto-busts whenever any of them changes).
 COPY apps/ ./apps/
 COPY config/ ./config/
 COPY detector/ ./detector/
@@ -38,17 +77,16 @@ COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Build identity, exposed at GET /. Stamped AFTER the COPY layers so any
-# code/config change busts the cache and the timestamp refreshes; if
-# nothing changed the cache hits and the stamp stays the same (correct:
-# no deploy happened). Pass --build-arg GIT_SHA=$(git rev-parse --short HEAD)
-# from your build command to embed the commit too.
+# code/config change busts the cache and refreshes the timestamp. Pass
+# --build-arg GIT_SHA=$(git rev-parse --short HEAD) to embed the commit.
 ARG GIT_SHA=unknown
 ENV BUILD_GIT_SHA=$GIT_SHA
 RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILD_TIME
 
-# Runtime defaults. DATABASE_URL, REDIS_URL, GLM_OCR_HOST and the formatter
-# API keys are supplied by the deploy environment (Coolify) — the values
-# below are safe local-dev fallbacks, NOT where the real services live.
+# Runtime defaults. DATABASE_URL, REDIS_URL, GLM_OCR_HOST, the formatter API
+# keys and the DO_* Spaces creds are supplied by the deploy environment
+# (Coolify) — the values below are safe local-dev fallbacks, NOT where the real
+# services live.
 #   - no DATABASE_URL  -> falls back to sqlite (local dev only)
 #   - GLM_OCR_HOST     -> the external GLM OCR box (its own GPU)
 #   - RQ_WORKERS       -> bounds concurrent OCR calls into the GLM box

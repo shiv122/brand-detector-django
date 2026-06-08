@@ -84,3 +84,21 @@ class DetectVideoRequest(BaseRequest):
 
         if "classification_weight_name" in self.data:
             self._string("classification_weight_name", min_length=1, max_length=255)
+
+        # OCR-during-detection: optional toggle + prompt source. When enabled,
+        # each processed frame is OCR'd via the external GLM endpoint. The prompt
+        # is resolved server-side with priority inline `prompt` > `prompt_slug`
+        # > `sport` (see DetectionService._resolve_ocr_prompt).
+        if "enable_ocr" in self.data:
+            self._boolean("enable_ocr")
+        else:
+            self.data["enable_ocr"] = False
+
+        if "sport" in self.data:
+            self._string("sport", min_length=1, max_length=255)
+
+        if "prompt_slug" in self.data:
+            self._string("prompt_slug", min_length=1, max_length=255)
+
+        if "prompt" in self.data:
+            self._string("prompt", min_length=1, max_length=10000)
