@@ -841,17 +841,19 @@ class DetectionService:
                 }
                 yield f"data: {json.dumps(summary_data)}\n\n"
 
-            # Send completion
-            processed_video_url = (
-                f"/static/{Path(video_path).name}" if create_video else None
-            )
-            yield f"data: {json.dumps({'type': 'complete', 'message': 'Video processing completed', 'total_frames': processed_count, 'processed_video_url': processed_video_url})}\n\n"
+            # Send completion. When create_video is requested the real URL is
+            # only known after the encode below, so it ships in video_ready —
+            # not here.
+            yield f"data: {json.dumps({'type': 'complete', 'message': 'Video processing completed', 'total_frames': processed_count, 'processed_video_url': None, 'creating_video': bool(create_video)})}\n\n"
 
             session.mark_completed()
 
-            # Create video in background if requested
+            # Render the annotated video synchronously, then tell the client it's
+            # ready (or that it failed). This keeps the SSE stream open for the
+            # encode so the "Creating video" indicator clears on video_ready
+            # instead of hanging forever.
             if create_video:
-                self._create_video_background(
+                processed_video_url = self._create_processed_video(
                     video_path,
                     session,
                     detection_results,
@@ -859,6 +861,10 @@ class DetectionService:
                     frame_prefix,
                     temp_frames_dir,
                 )
+                if processed_video_url:
+                    yield f"data: {json.dumps({'type': 'video_ready', 'total_frames': processed_count, 'processed_video_url': processed_video_url})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'video_ready', 'total_frames': processed_count, 'processed_video_url': None, 'message': 'Video creation failed'})}\n\n"
 
         except Exception as e:
             print(f"Error processing video: {str(e)}")
@@ -927,7 +933,7 @@ class DetectionService:
         )
         csv_file.flush()
 
-    def _create_video_background(
+    def _create_processed_video(
         self,
         video_path: str,
         session: ProcessingSession,
@@ -935,68 +941,69 @@ class DetectionService:
         fps: int,
         frame_prefix: str,
         temp_frames_dir: Path,
-    ):
-        """Create video in background using FFmpeg"""
-        import threading
+    ) -> Optional[str]:
+        """Render the annotated output video with FFmpeg, synchronously.
 
-        def create_video():
-            try:
-                cap = cv2.VideoCapture(video_path)
-                frame_count = 0
+        Returns the public `/static/...` URL on success, or None on failure.
+        Runs inline in the SSE generator (NOT a background thread) so the
+        caller can emit a `video_ready` event once the file actually exists —
+        otherwise the client's "Creating video" indicator never clears.
+        """
+        try:
+            cap = cv2.VideoCapture(video_path)
+            frame_count = 0
 
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-                    # Find nearest processed frame
-                    nearest_frame = self._find_nearest_processed_frame(
-                        frame_count, detection_results.keys()
-                    )
-
-                    if nearest_frame in detection_results:
-                        detections, annotated_frame = detection_results[nearest_frame]
-                        if detections:
-                            annotated_frame = self._apply_detections_to_frame(
-                                frame, detections
-                            )
-                    else:
-                        annotated_frame = frame
-
-                    # Save to temp directory
-                    frame_filename = f"frame_{frame_prefix}_{frame_count:06d}.jpg"
-                    temp_frame_path = temp_frames_dir / frame_filename
-                    cv2.imwrite(str(temp_frame_path), annotated_frame)
-                    frame_count += 1
-
-                cap.release()
-
-                # Create video with FFmpeg
-                processed_video_path = (
-                    Path(self.config.static_dir)
-                    / f"processed_{int(time.time())}_{Path(video_path).name}"
-                )
-                self._create_video_from_frames(
-                    temp_frames_dir,
-                    processed_video_path,
-                    fps,
-                    frame_count,
-                    frame_prefix,
+                # Find nearest processed frame
+                nearest_frame = self._find_nearest_processed_frame(
+                    frame_count, detection_results.keys()
                 )
 
-                session.processed_video_path = str(processed_video_path)
-                session.save()
+                if nearest_frame in detection_results:
+                    detections, annotated_frame = detection_results[nearest_frame]
+                    if detections:
+                        annotated_frame = self._apply_detections_to_frame(
+                            frame, detections
+                        )
+                else:
+                    annotated_frame = frame
 
-                # Cleanup
-                shutil.rmtree(temp_frames_dir, ignore_errors=True)
-                if video_path and os.path.exists(video_path):
-                    os.unlink(video_path)
+                # Save to temp directory
+                frame_filename = f"frame_{frame_prefix}_{frame_count:06d}.jpg"
+                temp_frame_path = temp_frames_dir / frame_filename
+                cv2.imwrite(str(temp_frame_path), annotated_frame)
+                frame_count += 1
 
-            except Exception as e:
-                print(f"[VIDEO CREATION ERROR] {str(e)}")
+            cap.release()
 
-        thread = threading.Thread(target=create_video, daemon=True)
-        thread.start()
+            # Create video with FFmpeg
+            processed_video_name = f"processed_{int(time.time())}_{Path(video_path).name}"
+            processed_video_path = Path(self.config.static_dir) / processed_video_name
+            self._create_video_from_frames(
+                temp_frames_dir,
+                processed_video_path,
+                fps,
+                frame_count,
+                frame_prefix,
+            )
+
+            session.processed_video_path = str(processed_video_path)
+            session.save()
+
+            # Cleanup
+            shutil.rmtree(temp_frames_dir, ignore_errors=True)
+            if video_path and os.path.exists(video_path):
+                os.unlink(video_path)
+
+            return f"/static/{processed_video_name}"
+
+        except Exception as e:
+            print(f"[VIDEO CREATION ERROR] {str(e)}")
+            return None
 
     def _find_nearest_processed_frame(
         self, current_frame: int, processed_frames: list
