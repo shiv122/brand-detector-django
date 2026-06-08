@@ -23,6 +23,7 @@ from apps.api.v1.shared_services import (
     _classification_service,
     _counting_service,
     _detection_service,
+    _spaces_service,
 )
 
 
@@ -284,6 +285,73 @@ def detect_video(request):
 
 
 @extend_schema(
+    summary="Get a presigned URL to upload a video straight to Spaces",
+    description=(
+        "Returns a presigned PUT URL the browser uploads the video to directly "
+        "(bypassing this backend, so large files don't hit the proxy), plus a "
+        "presigned GET URL to pass back as `file_url` on /video/detect."
+    ),
+    request={
+        "application/json": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "Original filename (used for the extension)."},
+                "content_type": {"type": "string", "description": "MIME type, e.g. video/mp4."},
+            },
+        }
+    },
+    responses={
+        200: {
+            "example": {
+                "upload_url": "https://bucket.region.digitaloceanspaces.com/video_uploads/ab12.mp4?X-Amz-...",
+                "download_url": "https://bucket.region.digitaloceanspaces.com/video_uploads/ab12.mp4?X-Amz-...",
+                "key": "video_uploads/ab12.mp4",
+            }
+        }
+    },
+)
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def video_upload_url(request):
+    """Mint presigned upload (PUT) + download (GET) URLs for a video on Spaces."""
+    import uuid
+    from pathlib import Path as _Path
+    from rest_framework import status as _status
+
+    if not _spaces_service.is_configured():
+        return Response(
+            {"error": "Spaces is not configured — set the DO_* env vars."},
+            status=_status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    # Only allow video extensions so the presigned URL can't be used to stash
+    # arbitrary file types (.html/.svg/.js) in the bucket. Objects are private
+    # (no public-read ACL), but this keeps the upload surface narrow.
+    allowed_exts = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".mpeg", ".mpg"}
+    data = request.data or {}
+    filename = str(data.get("filename") or "video.mp4")
+    ext = (_Path(filename).suffix or ".mp4").lower()
+    if ext not in allowed_exts:
+        return Response(
+            {"error": f"unsupported video extension '{ext}'"},
+            status=_status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+    key = f"video_uploads/{uuid.uuid4().hex}{ext}"
+
+    # GET must outlive the upload + the whole detection download; keep it long.
+    try:
+        upload_url = _spaces_service.presigned_put_url(key, expires=3600)
+        download_url = _spaces_service.presigned_get_url(key, expires=21600)
+    except Exception as exc:  # noqa: BLE001
+        return Response(
+            {"error": f"failed to presign Spaces URL: {exc}"},
+            status=_status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response({"upload_url": upload_url, "download_url": download_url, "key": key})
+
+
+@extend_schema(
     summary="Get session summary",
     description="Get summary of detection session including total detections and logo counts",
     parameters=[
@@ -492,6 +560,9 @@ urlpatterns = [
     *optional_slash_path(
         "video/detect", detect_video, name="detection-video"
     ),  # POST /api/v1/video/detect or /api/v1/video/detect/
+    *optional_slash_path(
+        "video/upload-url", video_upload_url, name="detection-video-upload-url"
+    ),  # POST /api/v1/video/upload-url — presigned Spaces upload + download URLs
     *optional_slash_path(
         r"session/(?P<session_id>[^/]+)/summary",
         session_summary,

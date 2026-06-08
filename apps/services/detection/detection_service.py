@@ -34,7 +34,57 @@ from apps.utils.file_helpers import ensure_directory_exists
 from apps.services.ocr.ocr_queue import enqueue_ocr_job
 from apps.utils.prompt_render import render_prompt
 
+import ipaddress
+import socket
+from urllib.parse import urlparse, urljoin
+
 import requests
+
+
+# Cap on a downloaded video (file_url flow). Unbounded writes are a disk-fill
+# DoS; override with MAX_VIDEO_DOWNLOAD_BYTES.
+MAX_VIDEO_DOWNLOAD_BYTES = int(
+    os.getenv("MAX_VIDEO_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024))
+)
+_MAX_DOWNLOAD_REDIRECTS = 5
+
+
+def _host_resolves_to_blocked_ip(host: str) -> bool:
+    """True if any address `host` resolves to is private/loopback/link-local/
+    reserved/multicast — i.e. an SSRF target inside our own network."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return True  # can't resolve -> treat as unsafe
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return True
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+        ):
+            return True
+    return False
+
+
+def assert_safe_public_url(url: str) -> None:
+    """Raise ValueError unless `url` is an http(s) URL whose host resolves only
+    to public addresses. Guards the user-supplied file_url against SSRF
+    (cloud metadata, loopback, internal services)."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http(s) URLs are allowed")
+    if not parsed.hostname:
+        raise ValueError("URL has no host")
+    if _host_resolves_to_blocked_ip(parsed.hostname):
+        raise ValueError("URL resolves to a disallowed (internal) address")
 
 
 class DetectionService:
@@ -406,14 +456,40 @@ class DetectionService:
 
             yield f"data: {json.dumps({'type': 'download_status', 'status': 'Connecting to server...', 'percentage': 0})}\n\n"
 
-            # Download video synchronously with proper headers
+            # Download video synchronously with proper headers. SSRF-safe:
+            # validate the host resolves to a public address and re-validate on
+            # every redirect hop (a public URL can 30x to an internal one), so
+            # file_url can't be used to reach cloud metadata / internal hosts.
             try:
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
                 }
-                response = requests.get(
-                    file_url, stream=True, timeout=300, headers=headers
-                )
+                current_url = file_url
+                response = None
+                for _ in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+                    assert_safe_public_url(current_url)
+                    response = requests.get(
+                        current_url,
+                        stream=True,
+                        timeout=300,
+                        headers=headers,
+                        allow_redirects=False,
+                    )
+                    if response.is_redirect or response.is_permanent_redirect:
+                        loc = response.headers.get("Location")
+                        response.close()
+                        if not loc:
+                            raise ValueError("Redirect without Location header")
+                        current_url = urljoin(current_url, loc)
+                        continue
+                    break
+                else:
+                    raise ValueError("Too many redirects")
+            except ValueError as e:
+                # Blocked by the SSRF guard (or redirect limit) — refuse.
+                print(f"[DOWNLOAD BLOCKED] {file_url}: {e}")
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Refused to download URL: {e}'})}\n\n"
+                return
             except requests.exceptions.RequestException as e:
                 error_msg = f"Failed to connect to URL: {str(e)}"
                 print(f"[DOWNLOAD ERROR] {error_msg}")
@@ -424,6 +500,13 @@ class DetectionService:
                 error_msg = f"Failed to download video: HTTP {response.status_code}"
                 print(f"[DOWNLOAD ERROR] {error_msg}")
                 yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+                return
+
+            # Reject oversized downloads up front when the server declares size.
+            declared_size = int(response.headers.get("content-length", 0) or 0)
+            if declared_size and declared_size > MAX_VIDEO_DOWNLOAD_BYTES:
+                response.close()
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Video exceeds the maximum allowed size'})}\n\n"
                 return
 
             video_filename = f"uploaded_{int(time.time())}_{filename}"
@@ -450,8 +533,20 @@ class DetectionService:
                 with open(video_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
-                            f.write(chunk)
                             downloaded += len(chunk)
+                            # Enforce the cap mid-stream too: a server can omit
+                            # or under-report content-length to slip past the
+                            # up-front check.
+                            if downloaded > MAX_VIDEO_DOWNLOAD_BYTES:
+                                response.close()
+                                f.close()
+                                try:
+                                    os.unlink(video_path)
+                                except OSError:
+                                    pass
+                                yield f"data: {json.dumps({'type': 'error', 'message': 'Video exceeds the maximum allowed size'})}\n\n"
+                                return
+                            f.write(chunk)
 
                             if (
                                 downloaded - last_progress_update

@@ -64,6 +64,27 @@ class SpacesService:
     def public_url(self, key: str) -> str:
         return f"{self._public_base}/{key.lstrip('/')}"
 
+    def presigned_put_url(self, key: str, expires: int = 3600) -> str:
+        """A time-limited URL the browser can PUT raw bytes to directly.
+
+        Signed with only Bucket+Key so the client can send any Content-Type
+        without breaking the signature (Content-Type isn't a signed header).
+        """
+        return self.client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self.config.spaces_bucket, "Key": key},
+            ExpiresIn=expires,
+        )
+
+    def presigned_get_url(self, key: str, expires: int = 3600) -> str:
+        """A time-limited URL to fetch the object — handed to the detector's
+        file_url download flow so the uploaded video need not be public."""
+        return self.client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.config.spaces_bucket, "Key": key},
+            ExpiresIn=expires,
+        )
+
     def upload_bytes(
         self,
         key: str,
