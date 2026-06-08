@@ -210,15 +210,18 @@ class OcrService:
         return self.config.ocr_provider
 
     def is_available(self) -> bool:
-        if not (self.config.local_ocr_ollama_host and self.config.local_ocr_ollama_model):
-            return False
+        # Only the external GLM OCR endpoint is required. The stage-2 text
+        # formatter (DeepSeek/Gemini) is optional — without it we return the
+        # raw extracted text instead of structured JSON.
+        return bool(self.config.glm_ocr_host and self.config.glm_ocr_model)
+
+    def _formatter_configured(self) -> bool:
         provider = self.config.text_formatter_provider
         if provider == "gemini":
             return bool(self.config.gemini_text_api_key and self.config.gemini_text_base_url)
-        # default: deepseek
         return bool(self.config.deepseek_text_api_key and self.config.deepseek_text_base_url)
 
-    def run(self, image_data: bytes, prompt: str) -> Dict[str, Any]:
+    def run(self, image_url: str, prompt: str) -> Dict[str, Any]:
         if self.provider != "local":
             return {
                 "error": (
@@ -227,84 +230,42 @@ class OcrService:
                 ),
                 "prompt": prompt,
             }
-        return self._run_local(image_data, prompt)
+        return self._run_local(image_url, prompt)
 
     # ----------------------------------------------------------------- local
 
-    def _run_local(self, image_data: bytes, prompt: str) -> Dict[str, Any]:
+    def _run_local(self, image_url: str, prompt: str) -> Dict[str, Any]:
         formatter_provider = self.config.text_formatter_provider
-        if formatter_provider == "gemini":
-            if not self.config.gemini_text_api_key:
-                return {
-                    "error": (
-                        "GEMINI_TEXT_API_KEY is not set — needed to format "
-                        "extracted text into JSON."
-                    ),
-                    "prompt": prompt,
-                }
-        else:
-            if not self.config.deepseek_text_api_key:
-                return {
-                    "error": (
-                        "DEEPSEEK_TEXT_API_KEY is not set — needed to format "
-                        "extracted text into JSON."
-                    ),
-                    "prompt": prompt,
-                }
+        formatter_configured = self._formatter_configured()
 
         debug = _ocr_debug_enabled()
 
-        # Stage 1: extract text via remote Ollama (GLM_OCR container).
-        from apps.services.ocr.ollama_ocr_engine import OllamaOcrEngine
+        # Stage 1: extract text from the EXTERNAL GLM OCR service. We hand it
+        # the image URL (Spaces); it fetches the bytes itself.
+        from apps.services.ocr.glm_ocr_client import GlmOcrClient
 
-        engine = OllamaOcrEngine(
-            host=self.config.local_ocr_ollama_host,
-            model=self.config.local_ocr_ollama_model,
-            max_new_tokens=self.config.local_ocr_max_new_tokens,
-            timeout_seconds=self.config.local_ocr_ollama_timeout_seconds,
+        engine = GlmOcrClient(
+            host=self.config.glm_ocr_host,
+            model=self.config.glm_ocr_model,
+            max_new_tokens=self.config.glm_ocr_max_new_tokens,
+            timeout_seconds=self.config.glm_ocr_timeout_seconds,
         )
 
         if debug:
             print(
-                f"\n[OCR/Local] extract via ollama "
-                f"model={self.config.local_ocr_ollama_model} "
-                f"host={self.config.local_ocr_ollama_host} "
-                f"image={len(image_data)} bytes"
+                f"\n[OCR/GLM] extract via external glm-ocr "
+                f"model={self.config.glm_ocr_model} "
+                f"host={self.config.glm_ocr_host} "
+                f"image_url={image_url}"
             )
 
-        # Bound the number of concurrent calls into Ollama across ALL RQ
-        # workers via a Redis counter — Ollama serves one request at a
-        # time per model (OLLAMA_NUM_PARALLEL=1), so without this limit
-        # 12 workers race against 1 slot, latency collapses, and the
-        # queue stalls. The slot is held only across the HTTP call.
-        from apps.services.ocr.ocr_concurrency import ollama_slot
-
-        try:
-            with ollama_slot():
-                extracted_text, ocr_timing = engine.extract_text(
-                    image_data, self.config.local_ocr_extract_prompt
-                )
-        except TimeoutError as e:
-            # No Ollama capacity within the wait budget — surface this as a
-            # clean failure rather than letting the worker hang. The frontend
-            # will see it as a failed job and stop polling that ID.
-            if debug:
-                print(f"[OCR/Local] slot timeout: {e}")
-            return {
-                "error": str(e),
-                "prompt": prompt,
-                "glm_timing": {"glm_ocr_backend": "ollama", "slot_timeout": True},
-            }
+        extracted_text, ocr_timing = engine.extract_text(
+            image_url, self.config.glm_ocr_extract_prompt
+        )
         glm_timing: Dict[str, Any] = {
-            "glm_ocr_load": ocr_timing.get("load_ms", 0),
-            "glm_ocr_inference": ocr_timing.get("inference_ms", 0),
-            "glm_ocr_backend": "ollama",
+            "glm_ocr_backend": "glm-service",
+            **{f"glm_ocr_{k}": v for k, v in ocr_timing.items()},
         }
-        if "network_ms" in ocr_timing:
-            glm_timing["glm_ocr_network"] = ocr_timing["network_ms"]
-        if "ollama_total_ms" in ocr_timing:
-            glm_timing["ollama_total_ms"] = ocr_timing["ollama_total_ms"]
-            glm_timing["ollama_eval_ms"] = ocr_timing["ollama_eval_ms"]
 
         if extracted_text is None:
             return {
@@ -315,10 +276,21 @@ class OcrService:
 
         if debug:
             print(
-                f"[OCR/Local] extract ok load={ocr_timing.get('load_ms', 0)}ms "
+                f"[OCR/GLM] extract ok load={ocr_timing.get('load_ms', 0)}ms "
                 f"inf={ocr_timing.get('inference_ms', 0)}ms "
                 f"text_len={len(extracted_text)}"
             )
+
+        # No stage-2 formatter configured → return the raw GLM text as-is.
+        if not formatter_configured:
+            return {
+                "provider": "local",
+                "raw_text": extracted_text,
+                "formatted": None,
+                "prompt": prompt,
+                "text_formatter_provider": None,
+                "timing_ms": glm_timing,
+            }
 
         # Stage 2: text formatter (DeepSeek or Gemini) shapes raw text into JSON.
         if formatter_provider == "gemini":

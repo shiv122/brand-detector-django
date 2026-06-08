@@ -11,7 +11,6 @@ import os
 import subprocess
 import shutil
 import csv
-import uuid
 from pathlib import Path
 from typing import List, Tuple, Optional, Generator
 from datetime import datetime
@@ -23,16 +22,10 @@ from apps.services.model.model_service import ModelService, DetectionResult
 from apps.services.image.image_service import ImageService
 from apps.services.classification.classification_service import ClassificationService
 from apps.services.counting.counting_service import CountingService
-from apps.services.ocr.ocr_service import OcrService
-from apps.services.ocr.ocr_queue import enqueue_ocr_job
-from apps.core.models import ProcessingSession, Frame, Detection, Classification, SportPrompt
+from apps.core.models import ProcessingSession, Frame, Detection, Classification
 from apps.core.enums import ProcessingStatus
 from apps.utils.file_helpers import ensure_directory_exists
-from apps.utils.image_helpers import resize_bytes_for_ocr, resize_for_ocr
-from apps.utils.prompt_render import render_prompt
 
-
-OCR_MAX_DIM = 1280
 import requests
 
 
@@ -46,14 +39,14 @@ class DetectionService:
         image_service: ImageService,
         classification_service: Optional[ClassificationService] = None,
         counting_service: Optional[CountingService] = None,
-        ocr_service: Optional[OcrService] = None,
+        spaces_service=None,
     ):
         self.config = config
         self.model_service = model_service
         self.image_service = image_service
         self.classification_service = classification_service
         self.counting_service = counting_service
-        self.ocr_service = ocr_service
+        self.spaces_service = spaces_service
         self.csv_dir = Path(self.config.static_dir) / "csv_reports"
 
         # Ensure directories exist
@@ -64,25 +57,7 @@ class DetectionService:
         ensure_directory_exists(self.config.static_dir)
         ensure_directory_exists(self.config.frames_dir)
         ensure_directory_exists(Path(self.config.static_dir) / "temp_frames")
-        ensure_directory_exists(Path(self.config.static_dir) / "ocr_inputs")
         ensure_directory_exists(str(self.csv_dir))
-
-    def _persist_for_ocr(self, image_bytes: bytes, suffix: str = ".jpg") -> str:
-        """Drop image bytes onto disk so an RQ worker can read them later.
-
-        Resizes so the longest edge is at most OCR_MAX_DIM (1280px). Uses
-        ocr_inputs/ rather than frames_dir because these aren't browsable
-        detection artefacts — they're ephemeral handoffs to the worker.
-        """
-        out_dir = Path(self.config.static_dir) / "ocr_inputs"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        resized = resize_bytes_for_ocr(image_bytes, max_dim=OCR_MAX_DIM)
-        # Re-encoded as JPEG by resize_bytes_for_ocr when downscaling,
-        # so write .jpg in that case regardless of original suffix.
-        out_suffix = ".jpg" if resized is not image_bytes else suffix
-        out_path = out_dir / f"{uuid.uuid4().hex}{out_suffix}"
-        out_path.write_bytes(resized)
-        return str(out_path)
 
     def is_model_loaded(self) -> bool:
         """Check if model is loaded"""
@@ -149,57 +124,31 @@ class DetectionService:
             print(f"[CLASSIFICATION] Error classifying detection: {str(e)}")
             return None
 
-    def _resolve_ocr_prompt(
-        self, source: Optional[dict]
-    ) -> Optional[Tuple[str, dict]]:
-        """Resolve an OCR prompt + metadata from the validated request data.
+    def _store_frame_image(
+        self, frame_filename: str, jpg_bytes: bytes, annotated_frame: np.ndarray
+    ) -> Tuple[str, str, str]:
+        """Persist an annotated frame and return (frame_url, s3_key, local_path).
 
-        Returns (prompt_text, prompt_meta) or None when no OCR is requested
-        / no matching prompt can be found.
+        Uploads to DigitalOcean Spaces when configured (frame_url = public S3
+        URL, local_path = ""); on any failure — or when Spaces is unconfigured —
+        falls back to a local /static file so detection never breaks.
         """
-        if not source:
-            return None
-        inline = (source.get("prompt") or "").strip()
-        slug = (source.get("prompt_slug") or "").strip()
-        sport = (source.get("sport") or "").strip()
+        if self.spaces_service and self.spaces_service.is_configured() and jpg_bytes:
+            key = f"{self.config.spaces_frames_prefix}/{frame_filename}"
+            try:
+                url = self.spaces_service.upload_bytes(
+                    key, jpg_bytes, content_type="image/jpeg"
+                )
+                return url, key, ""
+            except Exception as e:  # noqa: BLE001 - fall back to local on any error
+                print(f"[SPACES] upload failed for {key}: {e}; using local /static")
 
-        if inline:
-            return inline, {"source": "inline"}
-
-        if slug:
-            sp = SportPrompt.objects.filter(slug=slug).first()
-            if sp is not None:
-                brands = list(sp.allowed_brands or [])
-                meta = {
-                    "source": "stored",
-                    "slug": sp.slug,
-                    "name": sp.name,
-                    "sport": sp.sport,
-                }
-                if brands:
-                    meta["allowed_brands"] = brands
-                return render_prompt(sp.prompt, brands), meta
-
-        if sport:
-            sport_lower = sport.lower()
-            sp = (
-                SportPrompt.objects.filter(slug=sport_lower).first()
-                or SportPrompt.objects.filter(sport__iexact=sport_lower)
-                .order_by("-updated_at")
-                .first()
-            )
-            if sp is not None:
-                brands = list(sp.allowed_brands or [])
-                meta = {
-                    "source": "sport",
-                    "slug": sp.slug,
-                    "name": sp.name,
-                    "sport": sp.sport,
-                }
-                if brands:
-                    meta["allowed_brands"] = brands
-                return render_prompt(sp.prompt, brands), meta
-        return None
+        frame_path = Path(self.config.frames_dir) / frame_filename
+        if jpg_bytes:
+            frame_path.write_bytes(jpg_bytes)
+        else:
+            cv2.imwrite(str(frame_path), annotated_frame)
+        return f"/static/frames/{frame_filename}", "", str(frame_path)
 
     def update_config(self, data: dict) -> Response:
         """Update configuration (data is already validated)"""
@@ -252,12 +201,6 @@ class DetectionService:
 
         files = request.FILES.getlist("files")
 
-        # Resolve OCR prompt once for the whole batch (same prompt across files).
-        ocr_resolution = self._resolve_ocr_prompt(validated_data)
-        ocr_active = bool(
-            ocr_resolution and self.ocr_service and self.ocr_service.is_available()
-        )
-
         results = []
         for file in files:
             if not self.image_service.validate_image_file(file.content_type, file.name):
@@ -302,17 +245,6 @@ class DetectionService:
                     "annotated_image": annotated_image_b64,
                 }
 
-                if ocr_active and ocr_resolution is not None:
-                    prompt, meta = ocr_resolution
-                    ext = Path(file.name).suffix or ".jpg"
-                    image_path = self._persist_for_ocr(contents, suffix=ext)
-                    result_dict["ocr_job"] = enqueue_ocr_job(
-                        image_path=image_path,
-                        prompt=prompt,
-                        prompt_meta=meta,
-                    )
-                    result_dict["ocr_prompt_meta"] = meta
-
                 results.append(result_dict)
             except Exception as e:
                 results.append(
@@ -354,10 +286,6 @@ class DetectionService:
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        # Resolve OCR prompt up front — looked up once for the whole video,
-        # then the worker reuses the saved Frame JPEG per frame.
-        ocr_resolution = self._resolve_ocr_prompt(validated_data)
-
         file = request.FILES.get("file")
 
         if file_url:
@@ -371,7 +299,6 @@ class DetectionService:
                     enable_classification,
                     weight_name,
                     classification_weight_name,
-                    ocr_resolution,
                 ),
                 content_type="text/event-stream",
             )
@@ -386,7 +313,6 @@ class DetectionService:
                     enable_classification,
                     weight_name,
                     classification_weight_name,
-                    ocr_resolution,
                 ),
                 content_type="text/event-stream",
             )
@@ -405,7 +331,6 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
-        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Stream video processing from URL with SSE"""
         video_path = None
@@ -505,7 +430,6 @@ class DetectionService:
                 enable_classification,
                 weight_name,
                 classification_weight_name,
-                ocr_resolution,
             ):
                 yield event
 
@@ -533,7 +457,6 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
-        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Stream video processing with SSE"""
         video_path = None
@@ -565,7 +488,6 @@ class DetectionService:
                 enable_classification,
                 weight_name,
                 classification_weight_name,
-                ocr_resolution,
             ):
                 yield event
 
@@ -588,7 +510,6 @@ class DetectionService:
         enable_classification: bool,
         weight_name: Optional[str] = None,
         classification_weight_name: Optional[str] = None,
-        ocr_resolution: Optional[Tuple[str, dict]] = None,
     ) -> Generator[str, None, None]:
         """Process video and stream results via SSE"""
         # Prepare settings in JSON format
@@ -677,21 +598,23 @@ class DetectionService:
                         # Calculate timestamp
                         timestamp = frame_count / video_fps
 
-                        # Save frame
+                        # Save frame — upload to Spaces (or local fallback).
                         frame_filename = (
                             f"frame_{frame_prefix}_{processed_count:06d}.jpg"
                         )
-                        frame_path = Path(self.config.frames_dir) / frame_filename
-                        cv2.imwrite(str(frame_path), annotated_frame)
-
-                        frame_url = f"/static/frames/{frame_filename}"
+                        ok, buf = cv2.imencode(".jpg", annotated_frame)
+                        jpg_bytes = buf.tobytes() if ok else b""
+                        frame_url, s3_key, local_path = self._store_frame_image(
+                            frame_filename, jpg_bytes, annotated_frame
+                        )
 
                         # Create frame in database
                         db_frame = Frame.objects.create(
                             session=session,
                             frame_number=processed_count,
-                            frame_path=str(frame_path),
+                            frame_path=local_path,
                             frame_url=frame_url,
+                            s3_key=s3_key,
                             timestamp=timestamp,
                             total_detections=len(detections),
                         )
@@ -758,31 +681,6 @@ class DetectionService:
                         # Store for video creation
                         detection_results[frame_count] = (detections, annotated_frame)
 
-                        # Enqueue OCR for this frame if the user opted in.
-                        # Save the ORIGINAL (un-annotated) frame downscaled
-                        # to OCR_MAX_DIM. The annotated frame has bbox
-                        # rectangles + class labels drawn on it, which OCR
-                        # would pick up as text overlays — so we use the
-                        # raw `frame` from cap.read() before detection ran.
-                        ocr_job_info: Optional[dict] = None
-                        if ocr_resolution is not None and self.ocr_service and self.ocr_service.is_available():
-                            prompt, meta = ocr_resolution
-                            ocr_input_dir = (
-                                Path(self.config.static_dir) / "ocr_inputs"
-                            )
-                            ocr_input_dir.mkdir(parents=True, exist_ok=True)
-                            ocr_input_path = ocr_input_dir / frame_filename
-                            cv2.imwrite(
-                                str(ocr_input_path),
-                                resize_for_ocr(frame, max_dim=OCR_MAX_DIM),
-                            )
-                            ocr_job_info = enqueue_ocr_job(
-                                image_path=str(ocr_input_path),
-                                prompt=prompt,
-                                prompt_meta=meta,
-                                frame_id=db_frame.id,
-                            )
-
                         # Stream frame data via SSE (minimal data - no large session_summary)
                         frame_data = {
                             "type": "frame",
@@ -794,8 +692,6 @@ class DetectionService:
                             "timestamp": timestamp,
                             "logo_counts": frame_logo_counts,
                         }
-                        if ocr_job_info is not None:
-                            frame_data["ocr_job"] = ocr_job_info
                         yield f"data: {json.dumps(frame_data)}\n\n"
 
                         # Send session summary only every 10 frames to reduce data size

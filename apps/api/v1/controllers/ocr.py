@@ -20,9 +20,9 @@ from apps.api.v1.requests.ocr_requests import (
     OcrRunRequest,
     SportPromptUpsertRequest,
 )
-from apps.api.v1.shared_services import _config, _ocr_service
-from apps.core.models import SportPrompt
-from apps.services.ocr.ocr_queue import fetch_jobs
+from apps.api.v1.shared_services import _config, _ocr_service, _spaces_service
+from apps.core.models import Frame, SportPrompt
+from apps.services.ocr.ocr_queue import enqueue_ocr_job, fetch_jobs
 from apps.utils.prompt_render import render_prompt
 
 
@@ -93,6 +93,59 @@ def _delete_reference_image(rel_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Prompt resolution — shared by /ocr/run and /ocr/frame
+# ---------------------------------------------------------------------------
+
+
+def _resolve_prompt(inline_prompt: str, prompt_slug: str, sport: str):
+    """Resolve (prompt, prompt_meta) from inline > slug > sport.
+
+    Returns (prompt, prompt_meta, None) on success, or (None, None, Response)
+    when the input is missing / no matching SportPrompt exists.
+    """
+    inline_prompt = (inline_prompt or "").strip()
+    prompt_slug = (prompt_slug or "").strip()
+    sport = (sport or "").strip()
+
+    if inline_prompt:
+        return render_prompt(inline_prompt, []), {"source": "inline"}, None
+
+    if prompt_slug:
+        sp = SportPrompt.objects.filter(slug=prompt_slug).first()
+        if sp is None:
+            return None, None, Response(
+                {"error": f"no SportPrompt with slug '{prompt_slug}'"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        source = "stored"
+    elif sport:
+        sport_lower = sport.lower()
+        sp = (
+            SportPrompt.objects.filter(slug=sport_lower).first()
+            or SportPrompt.objects.filter(sport__iexact=sport_lower)
+            .order_by("-updated_at")
+            .first()
+        )
+        if sp is None:
+            return None, None, Response(
+                {"error": f"no SportPrompt for sport '{sport}'"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        source = "sport"
+    else:
+        return None, None, Response(
+            {"error": "one of prompt / prompt_slug / sport is required"},
+            status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+    allowed_brands = list(sp.allowed_brands or [])
+    meta = {"source": source, "slug": sp.slug, "name": sp.name, "sport": sp.sport}
+    if allowed_brands:
+        meta["allowed_brands"] = allowed_brands
+    return render_prompt(sp.prompt, allowed_brands), meta, None
+
+
+# ---------------------------------------------------------------------------
 # /ocr/run
 # ---------------------------------------------------------------------------
 
@@ -136,87 +189,45 @@ def run_ocr(request):
     data = validation.validated()
 
     file = request.FILES["file"]
-    inline_prompt = (data.get("prompt") or "").strip()
-    prompt_slug = (data.get("prompt_slug") or "").strip()
-    sport = (data.get("sport") or "").strip()
-
-    prompt: str = ""
-    prompt_meta = {}
-    allowed_brands: list[str] = []
-    if inline_prompt:
-        prompt = inline_prompt
-        prompt_meta = {"source": "inline"}
-    elif prompt_slug:
-        sp = SportPrompt.objects.filter(slug=prompt_slug).first()
-        if sp is None:
-            return Response(
-                {"error": f"no SportPrompt with slug '{prompt_slug}'"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        prompt = sp.prompt
-        allowed_brands = list(sp.allowed_brands or [])
-        prompt_meta = {
-            "source": "stored",
-            "slug": sp.slug,
-            "name": sp.name,
-            "sport": sp.sport,
-        }
-    elif sport:
-        # Prefer a prompt whose slug equals the sport name (seeded canonical
-        # row); otherwise fall back to any prompt tagged with this sport.
-        sport_lower = sport.lower()
-        sp = (
-            SportPrompt.objects.filter(slug=sport_lower).first()
-            or SportPrompt.objects.filter(sport__iexact=sport_lower)
-            .order_by("-updated_at")
-            .first()
-        )
-        if sp is None:
-            return Response(
-                {"error": f"no SportPrompt for sport '{sport}'"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        prompt = sp.prompt
-        allowed_brands = list(sp.allowed_brands or [])
-        prompt_meta = {
-            "source": "sport",
-            "slug": sp.slug,
-            "name": sp.name,
-            "sport": sp.sport,
-        }
-    else:
-        return Response(
-            {"error": "one of prompt / prompt_slug / sport is required"},
-            status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        )
-
-    prompt = render_prompt(prompt, allowed_brands)
-    if allowed_brands:
-        prompt_meta["allowed_brands"] = allowed_brands
+    prompt, prompt_meta, err = _resolve_prompt(
+        data.get("prompt"), data.get("prompt_slug"), data.get("sport")
+    )
+    if err is not None:
+        return err
 
     if not _ocr_service.is_available():
-        missing = []
-        if not _config.local_ocr_ollama_host:
-            missing.append("LOCAL_OCR_OLLAMA_HOST")
-        if not _config.local_ocr_ollama_model:
-            missing.append("LOCAL_OCR_OLLAMA_MODEL")
-        if _config.text_formatter_provider == "gemini":
-            if not _config.gemini_text_api_key:
-                missing.append("GEMINI_TEXT_API_KEY")
-        else:
-            if not _config.deepseek_text_api_key:
-                missing.append("DEEPSEEK_TEXT_API_KEY")
-        err = (
-            f"OCR endpoint is not configured — set "
-            f"{', '.join(missing) or '<unknown>'} in .env, then restart."
-        )
         return Response(
-            {"error": err},
+            {"error": "GLM OCR endpoint is not configured — set GLM_OCR_HOST."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    if not _spaces_service.is_configured():
+        return Response(
+            {
+                "error": "Spaces is not configured — needed to host the upload "
+                "for the GLM OCR service to fetch. Set the DO_* env vars."
+            },
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
-    result = _ocr_service.run(file.read(), prompt)
+    # GLM OCR fetches by URL, so push the upload to Spaces first, then hand
+    # over its public URL.
+    import uuid
+
+    ext = (Path(file.name).suffix or ".jpg").lower()
+    key = f"ocr_uploads/{uuid.uuid4().hex}{ext}"
+    try:
+        image_url = _spaces_service.upload_bytes(
+            key, file.read(), content_type=file.content_type or "image/jpeg"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return Response(
+            {"error": f"failed to upload image to Spaces: {exc}"},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    result = _ocr_service.run(image_url, prompt)
     result["prompt_meta"] = prompt_meta
+    result["image_url"] = image_url
     return Response(result)
 
 
@@ -365,9 +376,73 @@ def ocr_jobs_status(request):
 
 
 # ---------------------------------------------------------------------------
+# /ocr/frame — enqueue OCR for an already-detected frame (on-demand, async)
+# ---------------------------------------------------------------------------
+
+
+@extend_schema(
+    summary="Enqueue OCR for a stored detection frame",
+    description=(
+        "Runs OCR on a frame that detection already produced, as a background "
+        "job that calls the external GLM OCR API. The job carries the frame's "
+        "image PATH (never image bytes); the result is written back to "
+        "Frame.ocr_summary and is also pollable via /ocr/jobs. "
+        "Prompt resolution: `prompt` > `prompt_slug` > `sport`."
+    ),
+)
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def enqueue_frame_ocr(request):
+    data = request.data or {}
+    raw_id = data.get("frame_id")
+    try:
+        frame_id = int(raw_id)
+    except (TypeError, ValueError):
+        return Response(
+            {"error": "frame_id (integer) is required"},
+            status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+    frame = Frame.objects.filter(id=frame_id).first()
+    if frame is None:
+        return Response({"error": "frame not found"}, status=status.HTTP_404_NOT_FOUND)
+    # GLM OCR fetches by URL — the frame must have a fetchable (Spaces) URL.
+    image_url = frame.frame_url or ""
+    if not image_url.startswith(("http://", "https://")):
+        return Response(
+            {
+                "error": "frame has no public URL (was it stored locally? "
+                "configure Spaces so frames are uploaded)."
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    prompt, prompt_meta, err = _resolve_prompt(
+        data.get("prompt"), data.get("prompt_slug"), data.get("sport")
+    )
+    if err is not None:
+        return err
+
+    if not _ocr_service.is_available():
+        return Response(
+            {"error": "GLM OCR endpoint is not configured — set GLM_OCR_HOST."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    job = enqueue_ocr_job(
+        image_url=image_url,
+        prompt=prompt,
+        prompt_meta=prompt_meta,
+        frame_id=frame.id,
+    )
+    return Response({"ocr_job": job, "frame_id": frame.id, "prompt_meta": prompt_meta})
+
+
+# ---------------------------------------------------------------------------
 
 urlpatterns = [
     *optional_slash_path("run", run_ocr, name="ocr-run"),
+    *optional_slash_path("frame", enqueue_frame_ocr, name="ocr-frame"),
     *optional_slash_path("jobs", ocr_jobs_status, name="ocr-jobs"),
     *optional_slash_path("sport-prompts", sport_prompts, name="ocr-sport-prompts"),
     *optional_slash_path(

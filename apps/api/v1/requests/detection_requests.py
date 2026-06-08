@@ -23,11 +23,7 @@ class SwitchWeightRequest(BaseRequest):
 
 
 class DetectImagesRequest(BaseRequest):
-    """Request validation for image detection.
-
-    OCR is optional. Resolution priority: `prompt` > `prompt_slug` > `sport`.
-    Pass any one to enable OCR; omit all three to skip it.
-    """
+    """Request validation for image detection (YOLO + optional classification)."""
 
     def rules(self):
         if "confidence_threshold" in self.data:
@@ -37,21 +33,6 @@ class DetectImagesRequest(BaseRequest):
 
         if "weight_name" in self.data:
             self._string("weight_name", min_length=1, max_length=255)
-
-        if "sport" in self.data and self.data["sport"]:
-            self._string("sport", min_length=1, max_length=64)
-        else:
-            self.data["sport"] = ""
-
-        if "prompt_slug" in self.data and self.data["prompt_slug"]:
-            self._string("prompt_slug", min_length=1, max_length=128)
-        else:
-            self.data["prompt_slug"] = ""
-
-        if "prompt" in self.data and self.data["prompt"]:
-            self._string("prompt", max_length=16384)
-        else:
-            self.data["prompt"] = ""
 
         if "enable_classification" in self.data:
             self._boolean("enable_classification")
@@ -103,21 +84,3 @@ class DetectVideoRequest(BaseRequest):
 
         if "classification_weight_name" in self.data:
             self._string("classification_weight_name", min_length=1, max_length=255)
-
-        # OCR opt-in for video — same resolution priority as image detection
-        # (prompt > prompt_slug > sport). When all three are empty the
-        # per-frame OCR enqueue is skipped entirely.
-        if "sport" in self.data and self.data["sport"]:
-            self._string("sport", min_length=1, max_length=64)
-        else:
-            self.data["sport"] = ""
-
-        if "prompt_slug" in self.data and self.data["prompt_slug"]:
-            self._string("prompt_slug", min_length=1, max_length=128)
-        else:
-            self.data["prompt_slug"] = ""
-
-        if "prompt" in self.data and self.data["prompt"]:
-            self._string("prompt", max_length=16384)
-        else:
-            self.data["prompt"] = ""

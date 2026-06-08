@@ -11,6 +11,20 @@ FROM root200/detector-base:v1
 
 WORKDIR /app
 
+# nginx — fronts Gunicorn and serves /static/ (frames, videos, csv) off disk
+# so image bytes never occupy a Python worker. Kept in this thin layer (not
+# the base) for now; it's a stable ~6 MB layer that ships once and caches. On
+# the next base rebuild, move this apt line into Dockerfile.base.
+RUN apt-get update && apt-get install -y --no-install-recommends nginx \
+    && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
+COPY docker/nginx.conf /etc/nginx/nginx.conf.template
+
+# Runtime deps added to the base venv here (so we don't rebuild the 11 GB base
+# just to add them): psycopg2 for Postgres (DATABASE_URL), boto3 for uploading
+# frames to DigitalOcean Spaces. Fold into Dockerfile.base on the next rebuild.
+RUN uv pip install --python /app/.venv/bin/python --no-cache \
+        psycopg2-binary==2.9.9 boto3==1.34.162
+
 # App code (changes most often; keep these COPYs late so the BUILD_TIME
 # stamp below auto-busts whenever any of them changes).
 COPY apps/ ./apps/
@@ -32,32 +46,32 @@ ARG GIT_SHA=unknown
 ENV BUILD_GIT_SHA=$GIT_SHA
 RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILD_TIME
 
-# OCR / queue tuning. The timeout budget MUST stay ordered so a stalled job
-# fails CLEANLY (and retries) instead of being killed mid-flight:
-#   slot wait (150) < ollama x retries (120*3=360) + slot + format < RQ job (600)
-# OLLAMA_NUM_PARALLEL / MAX_CONCURRENT / RQ_WORKERS are the throughput knobs —
-# raise them only if the GPU has VRAM headroom (the vision model is large).
+# Runtime defaults. DATABASE_URL, REDIS_URL, GLM_OCR_HOST and the formatter
+# API keys are supplied by the deploy environment (Coolify) — the values
+# below are safe local-dev fallbacks, NOT where the real services live.
+#   - no DATABASE_URL  -> falls back to sqlite (local dev only)
+#   - GLM_OCR_HOST     -> the external GLM OCR box (its own GPU)
+#   - RQ_WORKERS       -> bounds concurrent OCR calls into the GLM box
 ENV DJANGO_SETTINGS_MODULE=detector.settings \
     ALLOWED_HOSTS=* \
     DEBUG=False \
     OCR_PROVIDER=local \
-    LOCAL_OCR_OLLAMA_HOST=http://127.0.0.1:11434 \
-    LOCAL_OCR_OLLAMA_MODEL=glm-ocr \
-    LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS=120 \
-    REDIS_URL=redis://127.0.0.1:6379/0 \
+    GLM_OCR_HOST=http://glm-ocr:8080 \
+    GLM_OCR_MODEL=glm-ocr \
+    GLM_OCR_TIMEOUT_SECONDS=120 \
+    GLM_OCR_RETRIES=3 \
+    GLM_OCR_RETRY_BASE_DELAY=1.0 \
+    REDIS_URL=redis://redis:6379/0 \
     PORT=8000 \
+    GUNICORN_PORT=8001 \
     WEB_CONCURRENCY=4 \
+    GUNICORN_THREADS=8 \
     GUNICORN_TIMEOUT=3600 \
-    RQ_WORKERS=12 \
+    RQ_WORKERS=4 \
     RQ_OCR_TIMEOUT=600 \
     RQ_RESULT_TTL=7200 \
     RQ_FAILURE_TTL=3600 \
-    RQ_OCR_JOB_RETRIES=3 \
-    OLLAMA_NUM_PARALLEL=2 \
-    LOCAL_OCR_OLLAMA_MAX_CONCURRENT=3 \
-    LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS=150 \
-    LOCAL_OCR_OLLAMA_RETRIES=3 \
-    LOCAL_OCR_OLLAMA_RETRY_BASE_DELAY=1.0
+    RQ_OCR_JOB_RETRIES=3
 
 EXPOSE 8000
 

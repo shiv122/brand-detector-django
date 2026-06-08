@@ -12,8 +12,13 @@ class Frame(models.Model):
         db_index=True,
     )
     frame_number = models.IntegerField(db_index=True)
-    frame_path = models.CharField(max_length=500)
+    # Local disk path (only when Spaces is unconfigured; "" once uploaded).
+    frame_path = models.CharField(max_length=500, blank=True, default="")
+    # Public URL the dashboard/OCR use — a DigitalOcean Spaces URL when
+    # configured, else a local /static/ path.
     frame_url = models.CharField(max_length=500)
+    # Object key in the Spaces bucket (blank when stored locally).
+    s3_key = models.CharField(max_length=500, blank=True, default="")
     timestamp = models.FloatField(default=0.0)
     total_detections = models.IntegerField(default=0)
     ocr_summary = models.JSONField(null=True, blank=True)

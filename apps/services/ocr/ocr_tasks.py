@@ -1,16 +1,14 @@
 """
 RQ task functions for asynchronous OCR.
 
-These run inside `python manage.py rqworker ocr` and are the only entry
-point that talks to the OCR HTTP endpoint outside of the synchronous
-`/ocr/run` route. Detection enqueues one of these per image / per frame
-and returns immediately; the frontend polls `/api/v1/ocr/jobs` to learn
-when results are ready.
+These run inside `python manage.py rqworker ocr`. A job carries the frame's
+public image URL (DigitalOcean Spaces) — never image bytes — and the GLM OCR
+service fetches the image from that URL. The frontend polls `/api/v1/ocr/jobs`
+to learn when results are ready.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 
@@ -75,30 +73,6 @@ def _slim_result(result):
     return slim
 
 
-def _cleanup_ocr_input(image_path: str) -> None:
-    """Delete the worker's input frame once it has been read.
-
-    Detection writes one downscaled JPEG per OCR'd frame into
-    `<static>/ocr_inputs/`; without this they accumulate forever (a long
-    video leaves thousands of files = GBs of dead disk). We only delete files
-    that actually live under ocr_inputs/ — never an arbitrary path — and never
-    let a cleanup hiccup fail the job.
-
-    IMPORTANT: this runs only after `service.run()` returns normally. If the
-    work-horse raises (e.g. the RQ job timeout fires mid-call), we skip the
-    delete so the file survives for the retried attempt to re-read.
-    """
-    try:
-        from config.app_config import AppConfig
-
-        p = Path(image_path).resolve()
-        ocr_dir = (Path(AppConfig().static_dir) / "ocr_inputs").resolve()
-        if ocr_dir in p.parents:
-            p.unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001 - cleanup must never break the job
-        pass
-
-
 def _load_service():
     """Build an OcrService directly — do NOT go through shared_services.
 
@@ -119,38 +93,28 @@ def _load_service():
     return _OCR_SERVICE
 
 
-def run_ocr_from_path(
-    image_path: str,
+def run_ocr_from_url(
+    image_url: str,
     prompt: str,
     prompt_meta: Optional[Dict[str, Any]] = None,
     frame_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Worker entry point: read the image off disk and run OCR.
+    """Worker entry point: hand the image URL to the GLM OCR service.
 
     `frame_id` (when present) makes the worker also persist the OCR result
-    onto the matching Frame row so that the video page can hydrate from
-    DB on reload — the Redis result is the realtime channel, the DB is
-    the durable copy.
+    onto the matching Frame row so the dashboard can hydrate from DB on
+    reload — the Redis result is the realtime channel, the DB the durable copy.
     """
-    p = Path(image_path)
-    if not p.exists():
-        return {
-            "error": f"image not found: {image_path}",
-            "prompt": prompt,
-        }
+    if not image_url:
+        return {"error": "no image_url provided", "prompt": prompt}
 
-    image_bytes = p.read_bytes()
     service = _load_service()
-    # If service.run raises (incl. the RQ job-timeout death penalty), we fall
-    # straight out of this function WITHOUT deleting the input — so the retry
-    # can re-read it. Cleanup below only happens once we have a result in hand.
-    result = service.run(image_bytes, prompt)
+    result = service.run(image_url, prompt)
     if prompt_meta:
         result["prompt_meta"] = prompt_meta
 
-    # Trim debug-only / redundant fields and guarantee no image bytes land in
-    # Redis (the job return value) or the DB. The sync /ocr/run path keeps the
-    # full result; only this queued path is slimmed.
+    # Trim debug-only / redundant fields; guarantee no image bytes land in
+    # Redis or the DB. The sync /ocr/run path keeps the full result.
     result = _slim_result(result)
 
     if frame_id is not None:
@@ -162,9 +126,5 @@ def run_ocr_from_path(
             result.setdefault("warnings", []).append(
                 f"failed to persist ocr_summary: {exc}"
             )
-
-    # Success or a handled error dict (neither re-raises, so neither retries):
-    # the input frame is no longer needed — reclaim the disk.
-    _cleanup_ocr_input(image_path)
 
     return result

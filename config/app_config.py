@@ -21,33 +21,42 @@ class AppConfig:
             settings, "DEFAULT_CLASSIFICATION_WEIGHT", "cricket_classify.pt"
         )
 
-        # Only "local" remains: GLM-OCR (remote Ollama HTTP) extracts text,
-        # then the DeepSeek text API formats it into JSON.
+        # DigitalOcean Spaces (S3-compatible) for frame storage.
+        self.spaces_endpoint: str = getattr(settings, "SPACES_ENDPOINT", "")
+        self.spaces_region: str = getattr(settings, "SPACES_REGION", "")
+        self.spaces_bucket: str = getattr(settings, "SPACES_BUCKET", "")
+        self.spaces_access_key_id: str = getattr(settings, "SPACES_ACCESS_KEY_ID", "")
+        self.spaces_secret_access_key: str = getattr(
+            settings, "SPACES_SECRET_ACCESS_KEY", ""
+        )
+        self.spaces_public_base_url: str = getattr(
+            settings, "SPACES_PUBLIC_BASE_URL", ""
+        )
+        self.spaces_frames_prefix: str = getattr(
+            settings, "SPACES_FRAMES_PREFIX", "frames"
+        )
+
         self.ocr_provider: str = str(
             getattr(settings, "OCR_PROVIDER", "local")
         ).strip().lower() or "local"
 
-        # Remote Ollama serving glm-ocr — points at the GLM_OCR container.
-        self.local_ocr_ollama_host: str = getattr(
-            settings, "LOCAL_OCR_OLLAMA_HOST", "http://localhost:11434"
+        # External GLM OCR box (its own GPU). Speaks the Ollama /api/chat
+        # protocol; point GLM_OCR_HOST at the deployed service.
+        self.glm_ocr_host: str = getattr(
+            settings, "GLM_OCR_HOST", "http://localhost:11434"
         )
-        self.local_ocr_ollama_model: str = getattr(
-            settings, "LOCAL_OCR_OLLAMA_MODEL", "glm-ocr"
+        self.glm_ocr_model: str = getattr(settings, "GLM_OCR_MODEL", "glm-ocr")
+        # Per-call ceiling for one GLM OCR request, retried on transient
+        # failures by the engine. Kept below RQ_OCR_TIMEOUT.
+        self.glm_ocr_timeout_seconds: float = float(
+            getattr(settings, "GLM_OCR_TIMEOUT_SECONDS", 120)
         )
-        # Per-call ceiling for one Ollama request. Kept below the RQ job
-        # timeout even after retries: timeout x retries (120 x 3 = 360s) plus
-        # the slot wait (150s) plus the format call (~60s) must fit inside
-        # RQ_OCR_TIMEOUT (600s). Warm calls finish in seconds; this only bites
-        # on a cold/stuck model, where failing and retrying is the right move.
-        self.local_ocr_ollama_timeout_seconds: float = float(
-            getattr(settings, "LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS", 120)
+        self.glm_ocr_max_new_tokens: int = int(
+            getattr(settings, "GLM_OCR_MAX_NEW_TOKENS", 2048)
         )
-        self.local_ocr_max_new_tokens: int = int(
-            getattr(settings, "LOCAL_OCR_MAX_NEW_TOKENS", 2048)
-        )
-        self.local_ocr_extract_prompt: str = getattr(
+        self.glm_ocr_extract_prompt: str = getattr(
             settings,
-            "LOCAL_OCR_EXTRACT_PROMPT",
+            "GLM_OCR_EXTRACT_PROMPT",
             (
                 "Extract all visible text from this image, preserving the "
                 "original layout, line breaks, and reading order. Return "

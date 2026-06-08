@@ -50,12 +50,12 @@ def _retry_spec():
 
 
 def enqueue_ocr_job(
-    image_path: str,
+    image_url: str,
     prompt: str,
     prompt_meta: Optional[Dict[str, Any]] = None,
     frame_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Enqueue an OCR run. Returns a dict the controller hands to the client.
+    """Enqueue an OCR run for an image URL. Returns a dict for the client.
 
     Shape:
         { "id": <rq job id>, "status": "queued" }
@@ -70,8 +70,8 @@ def enqueue_ocr_job(
         if retry is not None:
             enqueue_kwargs["retry"] = retry
         job = queue.enqueue(
-            "apps.services.ocr.ocr_tasks.run_ocr_from_path",
-            image_path,
+            "apps.services.ocr.ocr_tasks.run_ocr_from_url",
+            image_url,
             prompt,
             prompt_meta,
             frame_id,

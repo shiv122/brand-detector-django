@@ -73,14 +73,33 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "detector.wsgi.application"
 
-# Database
-# https://docs.djangoproject.com/en/5.2/ref/settings/#databases
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+# Database — external Postgres in production (Coolify) via DATABASE_URL,
+# falling back to sqlite for local dev when DATABASE_URL is unset. Postgres
+# needs the psycopg2 driver (declared in pyproject) at runtime; sqlite needs
+# nothing, so `manage.py check` works locally without it.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL:
+    from urllib.parse import urlparse, unquote
+
+    _db = urlparse(DATABASE_URL)
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": _db.path.lstrip("/"),
+            "USER": unquote(_db.username) if _db.username else "",
+            "PASSWORD": unquote(_db.password) if _db.password else "",
+            "HOST": _db.hostname or "",
+            "PORT": str(_db.port or ""),
+            "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "60")),
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -182,40 +201,35 @@ DEFAULT_CLASSIFICATION_WEIGHT = os.getenv(
 DEFAULT_FPS = 1
 DEFAULT_CONFIDENCE = 0.5
 
-# OCR pipeline: GLM-OCR (remote Ollama) extracts text → DeepSeek text API
-# formats it into JSON using the sport prompt. The only supported value is
-# "local"; the env var stays so future providers can be slotted in.
+# DigitalOcean Spaces (S3-compatible) — detection uploads each annotated frame
+# here and stores its public URL on the Frame row; OCR sends that URL to the
+# GLM box. When SPACES is unconfigured, detection falls back to local /static
+# frame files (dev only).
+SPACES_ENDPOINT = os.getenv("DO_ENDPOINT", "").strip()
+SPACES_REGION = os.getenv("DO_DEFAULT_REGION", "").strip()
+SPACES_BUCKET = os.getenv("DO_BUCKET", "").strip()
+SPACES_ACCESS_KEY_ID = os.getenv("DO_ACCESS_KEY_ID", "").strip()
+SPACES_SECRET_ACCESS_KEY = os.getenv("DO_SECRET_ACCESS_KEY", "").strip()
+# Public base for object URLs. Defaults to the virtual-hosted Spaces domain
+# derived from the endpoint + bucket; override to use a CDN domain.
+SPACES_PUBLIC_BASE_URL = os.getenv("DO_PUBLIC_BASE_URL", "").strip()
+# Key prefix under which frames are stored in the bucket.
+SPACES_FRAMES_PREFIX = os.getenv("DO_FRAMES_PREFIX", "frames").strip().strip("/")
+
+# OCR pipeline (runs out-of-band from detection, as an RQ job): the EXTERNAL
+# GLM OCR box extracts text → optional DeepSeek/Gemini formatter shapes it into
+# JSON. OCR_PROVIDER stays so future providers can be slotted in.
 OCR_PROVIDER = os.getenv("OCR_PROVIDER", "local").strip().lower() or "local"
 
-# GLM-OCR via remote Ollama (the GLM_OCR container).
-LOCAL_OCR_OLLAMA_HOST = os.getenv("LOCAL_OCR_OLLAMA_HOST", "http://localhost:11434")
-LOCAL_OCR_OLLAMA_MODEL = os.getenv("LOCAL_OCR_OLLAMA_MODEL", "glm-ocr")
-LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS = float(
-    os.getenv("LOCAL_OCR_OLLAMA_TIMEOUT_SECONDS", "180")
-)
-LOCAL_OCR_MAX_NEW_TOKENS = int(os.getenv("LOCAL_OCR_MAX_NEW_TOKENS", "2048"))
-# Robustness knobs for the Ollama call. Defaults are conservative for a
-# single-GPU Ollama serving one request at a time (OLLAMA_NUM_PARALLEL=1).
-#   MAX_CONCURRENT      — cluster-wide cap on in-flight calls. Set to ~the
-#                         actual parallelism the model can serve.
-#   SLOT_TIMEOUT        — how long a worker is willing to wait for a slot
-#                         before failing the job (still re-tryable upstream).
-#   RETRIES             — how many times to retry a single HTTP call on
-#                         timeout / 429 / 5xx, with exponential backoff.
-#   RETRY_BASE_DELAY    — base delay (seconds); doubles each attempt with
-#                         up to 30% jitter.
-LOCAL_OCR_OLLAMA_MAX_CONCURRENT = int(
-    os.getenv("LOCAL_OCR_OLLAMA_MAX_CONCURRENT", "2")
-)
-LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS = float(
-    os.getenv("LOCAL_OCR_OLLAMA_SLOT_TIMEOUT_SECONDS", "300")
-)
-LOCAL_OCR_OLLAMA_RETRIES = int(os.getenv("LOCAL_OCR_OLLAMA_RETRIES", "3"))
-LOCAL_OCR_OLLAMA_RETRY_BASE_DELAY = float(
-    os.getenv("LOCAL_OCR_OLLAMA_RETRY_BASE_DELAY", "1.0")
-)
-LOCAL_OCR_EXTRACT_PROMPT = os.getenv(
-    "LOCAL_OCR_EXTRACT_PROMPT",
+# External GLM OCR service (its own GPU). FastAPI /ocr endpoint that fetches
+# the image URL itself. Retry knobs are read directly from the env by the
+# client (GLM_OCR_RETRIES / GLM_OCR_RETRY_BASE_DELAY).
+GLM_OCR_HOST = os.getenv("GLM_OCR_HOST", "http://localhost:8080")
+GLM_OCR_MODEL = os.getenv("GLM_OCR_MODEL", "glm-ocr")
+GLM_OCR_TIMEOUT_SECONDS = float(os.getenv("GLM_OCR_TIMEOUT_SECONDS", "120"))
+GLM_OCR_MAX_NEW_TOKENS = int(os.getenv("GLM_OCR_MAX_NEW_TOKENS", "2048"))
+GLM_OCR_EXTRACT_PROMPT = os.getenv(
+    "GLM_OCR_EXTRACT_PROMPT",
     "Extract all visible text from this image, preserving the original "
     "layout, line breaks, and reading order. Return only the extracted text.",
 )
@@ -245,18 +259,12 @@ GEMINI_TEXT_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TEXT_TIMEOUT_SECONDS", "60
 GEMINI_TEXT_MAX_TOKENS = int(os.getenv("GEMINI_TEXT_MAX_TOKENS", "2048"))
 GEMINI_TEXT_TEMPERATURE = float(os.getenv("GEMINI_TEXT_TEMPERATURE", "0.0"))
 
-# Redis / django-rq — used to run OCR off the detection sync path so the
-# frontend gets detections back instantly and OCR results stream in once
-# the worker picks them up.
+# Redis / django-rq — EXTERNAL Redis (Coolify) via REDIS_URL. Runs OCR as
+# background jobs that call the external GLM OCR API; the durable copy of each
+# result lives on Frame.ocr_summary, the Redis result is the realtime channel.
+# DEFAULT_TIMEOUT must exceed one GLM call (timeout x retries) plus the
+# optional formatter call so a slow job isn't killed mid-flight.
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-# Timeout budget (must stay internally consistent — see ocr_concurrency.py):
-#   DEFAULT_TIMEOUT (job)  >  slot-wait  +  ollama(timeout x retries)  +  format
-#   600                    >  150        +  120 x 3 (=360)             +  60   = 570
-# If a job exceeds DEFAULT_TIMEOUT, RQ kills it (death penalty) — keep this the
-# *outermost* bound so the slot limiter's own TimeoutError fires first and the
-# job ends cleanly (and gets retried) instead of being killed mid-flight.
-# RESULT_TTL is generous so a long video's early results survive in Redis until
-# the frontend polls them (the durable copy still lives on Frame.ocr_summary).
 RQ_QUEUES = {
     "ocr": {
         "URL": REDIS_URL,
