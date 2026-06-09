@@ -29,9 +29,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   libgl1/libglib2.0-0 — opencv-python   libgomp1 — torch/ultralytics
 #   tini/supervisor      — process mgmt    curl/ca-certificates — install uv
 #   nginx                — public reverse proxy + /static/ file serving
+#   ffmpeg               — video frame extraction (ffmpeg + ffprobe binaries).
+#                          The detection worker shells out to these for robust,
+#                          time-accurate frame sampling; OpenCV's bundled FFmpeg
+#                          libs are NOT enough (we need the CLI tools).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl tini supervisor \
-        libgl1 libglib2.0-0 libgomp1 nginx \
+        libgl1 libglib2.0-0 libgomp1 nginx ffmpeg \
     && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
 
 # uv (manages the venv).
