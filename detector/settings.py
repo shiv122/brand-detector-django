@@ -287,12 +287,71 @@ GEMINI_TEXT_TEMPERATURE = float(os.getenv("GEMINI_TEXT_TEMPERATURE", "0.0"))
 # DEFAULT_TIMEOUT must exceed one GLM call (timeout x retries) plus the
 # optional formatter call so a slow job isn't killed mid-flight.
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+
+# Default RQ worker class: SimpleWorker (NO fork). The default rq Worker forks a
+# "work-horse" per job; forking AFTER torch/YOLO has initialized CUDA or Apple
+# MPS aborts that child with SIGABRT (signal 6) — "Work-horse terminated
+# unexpectedly", which silently kills detection jobs. SimpleWorker runs the job
+# in the worker process itself (model stays resident, nothing to fork-crash).
+# Applies to `rqworker` and `rqworker-pool` unless --worker-class is passed.
+RQ = {"WORKER_CLASS": os.getenv("RQ_WORKER_CLASS", "rq.SimpleWorker")}
+
 RQ_QUEUES = {
     "ocr": {
         "URL": REDIS_URL,
         "DEFAULT_TIMEOUT": int(os.getenv("RQ_OCR_TIMEOUT", "600")),
         "RESULT_TTL": int(os.getenv("RQ_RESULT_TTL", "7200")),
         "FAILURE_TTL": int(os.getenv("RQ_FAILURE_TTL", "3600")),
+    },
+    # Long-running video detection jobs run here, OFF the request/SSE path, so
+    # a closed browser / dropped connection / redeploy can't stop them. Kept on
+    # a SEPARATE queue from `ocr` so a multi-hour video never blocks short OCR
+    # calls. DEFAULT_TIMEOUT is a hard ceiling on one job; the worker also
+    # heartbeats, and the reaper resumes anything that dies before finishing.
+    "detection": {
+        "URL": REDIS_URL,
+        "DEFAULT_TIMEOUT": int(os.getenv("RQ_DETECTION_TIMEOUT", str(24 * 3600))),
+        "RESULT_TTL": int(os.getenv("RQ_RESULT_TTL", "7200")),
+        "FAILURE_TTL": int(os.getenv("RQ_FAILURE_TTL", "3600")),
+    },
+}
+
+# How long (seconds) a PROCESSING session may go without a heartbeat before the
+# reaper treats its worker as dead and re-enqueues it from processed_frames.
+DETECTION_HEARTBEAT_STALE_SECONDS = int(
+    os.getenv("DETECTION_HEARTBEAT_STALE_SECONDS", "120")
+)
+# Bound on automatic resume attempts so a genuinely poisonous video can't loop
+# forever; past this it stays FAILED for a human to look at.
+DETECTION_MAX_ATTEMPTS = int(os.getenv("DETECTION_MAX_ATTEMPTS", "5"))
+
+# Logging — explicit config so the detection path emits real, timestamped logs
+# (with tracebacks via logger.exception) to stdout, which supervisord/Docker
+# capture. Replaces the bare print()s that made silent stops un-diagnosable.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "[{asctime}] {levelname} {name}: {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+        },
+    },
+    "root": {"handlers": ["console"], "level": "WARNING"},
+    "loggers": {
+        "apps": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "django.request": {
+            "handlers": ["console"],
+            "level": "ERROR",
+            "propagate": False,
+        },
     },
 }
 

@@ -22,6 +22,10 @@ class Frame(models.Model):
     timestamp = models.FloatField(default=0.0)
     total_detections = models.IntegerField(default=0)
     ocr_summary = models.JSONField(null=True, blank=True)
+    # RQ job id of the OCR job enqueued for this frame. Persisted so the
+    # (reconnectable) SSE feed can hand the client back the job handle to poll —
+    # OCR runs async on the `ocr` queue and writes its result to ocr_summary.
+    ocr_job_id = models.CharField(max_length=64, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:

@@ -3,6 +3,8 @@ Detection Controller - Laravel-style (thin controllers)
 """
 
 from django.urls import path, re_path
+from django.http import StreamingHttpResponse
+from django.views.decorators.http import require_GET
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
@@ -272,16 +274,126 @@ def detect_images(request):
 @api_view(["POST"])
 @parser_classes([MultiPartParser, FormParser])
 def detect_video(request):
-    """Detect logos in video"""
-    # Validate request data (BaseRequest now handles QueryDict immutability)
+    """Queue a video for background detection.
+
+    Returns 202 with a session_id immediately — processing runs in the
+    `detection` RQ worker, NOT on this request. Subscribe to
+    GET /video/detect/{session_id}/events for the live SSE progress feed.
+    """
     validation = DetectVideoRequest(request.data, request.FILES)
 
     if validation.fails():
         return validation.errors_response()
 
-    # Pass validated data directly to service - no need to modify request.data
     validated_data = validation.validated()
-    return _detection_service.detect_video_handler(request, validated_data)
+    return _detection_service.enqueue_video_handler(request, validated_data)
+
+
+# Plain Django view (NOT @api_view): DRF runs content negotiation against the
+# request's Accept header, and since only JSONRenderer is configured it answers
+# `text/event-stream` with 406 "Could not satisfy the request Accept header".
+# An SSE endpoint returns raw bytes and must bypass DRF's renderer pipeline.
+@require_GET
+def video_events(request, session_id):
+    """Reconnectable SSE progress feed for a detection session.
+
+    GET /api/v1/video/detect/{session_id}/events?since={last_frame_number}
+    """
+    # Cursor is the last frame_number already seen; -1 (the default when absent)
+    # means "from the very start" so frame 0 is included.
+    try:
+        since = int(request.GET.get("since", -1))
+    except (TypeError, ValueError):
+        since = -1
+
+    response = StreamingHttpResponse(
+        _detection_service.iter_progress_events(session_id, since=since),
+        content_type="text/event-stream",
+    )
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"  # disable nginx buffering for SSE
+    return response
+
+
+@extend_schema(
+    summary="Resume a stopped/interrupted detection session",
+    description=(
+        "Re-enqueue an interrupted or failed session from where it left off "
+        "(processed_frames). No-op if the session is already active or "
+        "complete. The source video is re-read from the stored source_url."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="session_id", type=OpenApiTypes.STR,
+            location=OpenApiParameter.PATH, description="Session ID",
+        ),
+    ],
+    responses={200: {"example": {"ok": True, "status": "queued", "start_frame": 1492}}},
+)
+@api_view(["POST"])
+def resume_video(request, session_id):
+    """Resume a stopped session from its last processed frame."""
+    result = _detection_service.resume_session(session_id)
+    if not result.get("ok"):
+        return Response(result, status=404 if "not found" in str(result.get("error", "")).lower() else 400)
+    return Response(result)
+
+
+@extend_schema(
+    summary="Cancel a running/queued detection session",
+    description=(
+        "Stops a session that is queued or processing. The worker notices "
+        "within ~2s and stops; the session is left INTERRUPTED and can be "
+        "resumed later from where it stopped."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="session_id", type=OpenApiTypes.STR,
+            location=OpenApiParameter.PATH, description="Session ID",
+        ),
+    ],
+    responses={200: {"example": {"ok": True, "status": "interrupted"}}},
+)
+@api_view(["POST"])
+def cancel_video(request, session_id):
+    """Cancel a queued/running session (stays resumable)."""
+    result = _detection_service.cancel_session(session_id)
+    if not result.get("ok"):
+        return Response(result, status=404)
+    return Response(result)
+
+
+@extend_schema(
+    summary="Detection/OCR queue status",
+    description="Per-queue pending/started/failed counts and LIVE worker count. "
+    "A queue with jobs but 0 workers is why sessions stay 'queued'.",
+    responses={200: {"example": {"detection": {"pending": 3, "workers": 1, "total": 3}}}},
+)
+@api_view(["GET"])
+def queue_status(request):
+    """Queue depths + worker counts."""
+    return Response(_detection_service.get_queue_status())
+
+
+@extend_schema(
+    summary="Clear a job queue",
+    description="Drop all pending jobs from a queue (default: detection). For "
+    "the detection queue, also marks not-yet-started sessions as cancelled so "
+    "they don't get re-queued. A running job is left alone.",
+    request={"application/json": {"type": "object", "properties": {
+        "queue": {"type": "string", "enum": ["detection", "ocr"], "default": "detection"},
+    }}},
+    responses={200: {"example": {"ok": True, "queue": "detection", "removed": {"total": 12}, "cancelled_sessions": 3}}},
+)
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def queue_clear(request):
+    """Clear a job queue (detection or ocr)."""
+    queue = (request.data or {}).get("queue", "detection")
+    if queue not in ("detection", "ocr"):
+        return Response({"ok": False, "error": f"unknown queue '{queue}'"}, status=400)
+    result = _detection_service.clear_queue(queue)
+    return Response(result, status=200 if result.get("ok") else 502)
 
 
 @extend_schema(
@@ -559,7 +671,28 @@ urlpatterns = [
     ),  # POST /api/v1/images/detect or /api/v1/images/detect/
     *optional_slash_path(
         "video/detect", detect_video, name="detection-video"
-    ),  # POST /api/v1/video/detect or /api/v1/video/detect/
+    ),  # POST /api/v1/video/detect — queues a background job, returns session_id
+    *optional_slash_path(
+        r"video/detect/(?P<session_id>[^/]+)/events",
+        video_events,
+        name="detection-video-events",
+    ),  # GET /api/v1/video/detect/{id}/events — reconnectable SSE progress feed
+    *optional_slash_path(
+        r"video/detect/(?P<session_id>[^/]+)/resume",
+        resume_video,
+        name="detection-video-resume",
+    ),  # POST /api/v1/video/detect/{id}/resume — resume from processed_frames
+    *optional_slash_path(
+        r"video/detect/(?P<session_id>[^/]+)/cancel",
+        cancel_video,
+        name="detection-video-cancel",
+    ),  # POST /api/v1/video/detect/{id}/cancel — stop (stays resumable)
+    *optional_slash_path(
+        "video/queue", queue_status, name="detection-queue-status"
+    ),  # GET /api/v1/video/queue — depths + live worker counts
+    *optional_slash_path(
+        "video/queue/clear", queue_clear, name="detection-queue-clear"
+    ),  # POST /api/v1/video/queue/clear — drop pending jobs (+cancel sessions)
     *optional_slash_path(
         "video/upload-url", video_upload_url, name="detection-video-upload-url"
     ),  # POST /api/v1/video/upload-url — presigned Spaces upload + download URLs

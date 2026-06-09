@@ -14,7 +14,7 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 from drf_spectacular.types import OpenApiTypes
-from django.db.models import Count, Avg, Prefetch
+from django.db.models import Count, Avg, Prefetch, Q
 
 from apps.core.models import ProcessingSession, Frame, Detection, Classification
 
@@ -99,6 +99,10 @@ def list_sessions(request):
     qs = qs.annotate(
         detections_count=Count("detections", distinct=True),
         frames_count=Count("frames", distinct=True),
+        # Frames that have an OCR result stored — drives the "OCR n/N" badge.
+        ocr_frames_count=Count(
+            "frames", filter=Q(frames__ocr_summary__isnull=False), distinct=True
+        ),
         avg_confidence=Avg("detections__confidence"),
     ).order_by("-created_at")
 
@@ -142,6 +146,13 @@ def list_sessions(request):
                 "created_at": s.created_at.isoformat(),
                 "completed_at": s.completed_at.isoformat() if s.completed_at else None,
                 "has_processed_video": bool(s.processed_video_path),
+                # OCR: whether it was enabled for the run, and how many frames
+                # have an OCR result so far (so the UI can show "OCR n/N").
+                "ocr_enabled": bool(
+                    (s.run_params or {}).get("enable_ocr")
+                    or (s.settings or {}).get("enable_ocr")
+                ),
+                "ocr_frames": s.ocr_frames_count,
             }
         )
 
