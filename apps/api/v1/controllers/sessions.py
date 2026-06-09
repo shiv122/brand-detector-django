@@ -96,17 +96,9 @@ def list_sessions(request):
     if search:
         qs = qs.filter(video_filename__icontains=search) | qs.filter(session_id__icontains=search)
 
-    qs = qs.annotate(
-        detections_count=Count("detections", distinct=True),
-        frames_count=Count("frames", distinct=True),
-        # Frames that have an OCR result stored — drives the "OCR n/N" badge.
-        ocr_frames_count=Count(
-            "frames", filter=Q(frames__ocr_summary__isnull=False), distinct=True
-        ),
-        avg_confidence=Avg("detections__confidence"),
-    ).order_by("-created_at")
+    qs = qs.order_by("-created_at")
 
-    total = qs.count()
+    total = qs.count()  # plain COUNT over sessions — no joins
 
     try:
         limit = max(1, min(int(request.GET.get("limit", 50)), 200))
@@ -117,13 +109,31 @@ def list_sessions(request):
     except (TypeError, ValueError):
         offset = 0
 
-    page = qs[offset : offset + limit]
+    page = list(qs[offset : offset + limit])
+    ids = [s.id for s in page]
+
+    # Aggregate detections and frames in TWO separate grouped queries — NOT one
+    # multi-annotate. Annotating Count(detections) AND Count(frames) on the same
+    # queryset joins detections x frames per session (a cartesian explosion that
+    # makes this endpoint crawl on full-length videos). Two grouped queries over
+    # only the current page's sessions stay flat and index-friendly.
+    det_stats = {
+        r["session"]: r
+        for r in Detection.objects.filter(session_id__in=ids)
+        .values("session")
+        .annotate(c=Count("id"), uc=Count("class_name", distinct=True), ac=Avg("confidence"))
+    }
+    frame_stats = {
+        r["session"]: r
+        for r in Frame.objects.filter(session_id__in=ids)
+        .values("session")
+        .annotate(fc=Count("id"), oc=Count("id", filter=Q(ocr_summary__isnull=False)))
+    }
 
     sessions = []
     for s in page:
-        unique_brands = (
-            Detection.objects.filter(session=s).values("class_name").distinct().count()
-        )
+        d = det_stats.get(s.id) or {}
+        f = frame_stats.get(s.id) or {}
         progress = 0
         if s.total_frames > 0:
             progress = int((s.processed_frames / s.total_frames) * 100)
@@ -137,10 +147,10 @@ def list_sessions(request):
                 "total_frames": s.total_frames,
                 "processed_frames": s.processed_frames,
                 "progress": progress,
-                "frames_stored": s.frames_count,
-                "total_detections": s.detections_count,
-                "unique_brands": unique_brands,
-                "avg_confidence": s.avg_confidence,
+                "frames_stored": f.get("fc", 0),
+                "total_detections": d.get("c", 0),
+                "unique_brands": d.get("uc", 0),
+                "avg_confidence": d.get("ac"),
                 "frames_per_second": s.frames_per_second,
                 "confidence_threshold": s.confidence_threshold,
                 "created_at": s.created_at.isoformat(),
@@ -152,7 +162,7 @@ def list_sessions(request):
                     (s.run_params or {}).get("enable_ocr")
                     or (s.settings or {}).get("enable_ocr")
                 ),
-                "ocr_frames": s.ocr_frames_count,
+                "ocr_frames": f.get("oc", 0),
             }
         )
 
@@ -287,7 +297,12 @@ def export_session_xlsx(request, session_id):
     frames_qs = (
         session.frames.all()
         .order_by("frame_number")
-        .prefetch_related(Prefetch("detections", queryset=Detection.objects.all()))
+        .prefetch_related(
+            Prefetch(
+                "detections",
+                queryset=Detection.objects.prefetch_related("classifications"),
+            )
+        )
     )
 
     wb = Workbook()
@@ -295,9 +310,12 @@ def export_session_xlsx(request, session_id):
     ws.title = "Detections"
     headers = [
         "Project Name",
+        "Frame #",
+        "Timestamp (s)",
         "Image",
         "Brand",
         "Instances",
+        "Classification",
         "Size",
         "Raw Text",
     ]
@@ -316,7 +334,9 @@ def export_session_xlsx(request, session_id):
         if not detections:
             continue
 
-        image_name = os.path.basename(frame.frame_path) if frame.frame_path else ""
+        # Image name: local path when present, else the Spaces URL's filename
+        # (the Spaces flow stores frame_path="" and keeps the URL on frame_url).
+        image_name = os.path.basename((frame.frame_path or frame.frame_url or "").split("?")[0])
         ocr_text = _ocr_raw_text(frame.ocr_summary)
 
         # Group detections by brand within this frame
@@ -335,16 +355,34 @@ def export_session_xlsx(request, session_id):
             bh = int(round(rep.bbox_y2 - rep.bbox_y1))
             size_str = f"{bw}X{bh}"
 
+            # Classification: top-1 asset class per instance, counted across the
+            # group, e.g. "perimeter_board x3, caddie_bib x1".
+            cls_counts: dict[str, int] = defaultdict(int)
+            for det in dets:
+                ranked = list(det.classifications.all())  # prefetched, rank order
+                if ranked:
+                    cls_counts[ranked[0].class_name] += 1
+            classification_str = (
+                ", ".join(
+                    f"{name} x{cnt}"
+                    for name, cnt in sorted(cls_counts.items(), key=lambda kv: -kv[1])
+                )
+                or "N/A"
+            )
+
             ws.cell(row=row_idx, column=1, value=project_name)
-            ws.cell(row=row_idx, column=2, value=image_name)
-            ws.cell(row=row_idx, column=3, value=brand)
-            ws.cell(row=row_idx, column=4, value=instances)
-            ws.cell(row=row_idx, column=5, value=size_str)
-            ws.cell(row=row_idx, column=6, value=ocr_text)
+            ws.cell(row=row_idx, column=2, value=frame.frame_number)
+            ws.cell(row=row_idx, column=3, value=round(frame.timestamp or 0, 2))
+            ws.cell(row=row_idx, column=4, value=image_name)
+            ws.cell(row=row_idx, column=5, value=brand)
+            ws.cell(row=row_idx, column=6, value=instances)
+            ws.cell(row=row_idx, column=7, value=classification_str)
+            ws.cell(row=row_idx, column=8, value=size_str)
+            ws.cell(row=row_idx, column=9, value=ocr_text)
             row_idx += 1
 
-    # Column widths — keep it readable; OCR column gets more space.
-    widths = [22, 26, 22, 10, 12, 60]
+    # Column widths — keep it readable; classification + OCR get more space.
+    widths = [22, 8, 12, 26, 22, 10, 30, 12, 60]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + i)].width = w
 

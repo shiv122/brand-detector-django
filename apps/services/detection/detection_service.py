@@ -58,10 +58,11 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-# Cap on a downloaded video (file_url flow). Unbounded writes are a disk-fill
-# DoS; override with MAX_VIDEO_DOWNLOAD_BYTES.
+# Cap on a downloaded video (file_url flow). Guards against a disk-fill DoS from
+# an unbounded URL. Default 20 GB so full-length broadcasts aren't rejected;
+# override with MAX_VIDEO_DOWNLOAD_BYTES. Ensure the static volume has the disk.
 MAX_VIDEO_DOWNLOAD_BYTES = int(
-    os.getenv("MAX_VIDEO_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024))
+    os.getenv("MAX_VIDEO_DOWNLOAD_BYTES", str(20 * 1024 * 1024 * 1024))
 )
 _MAX_DOWNLOAD_REDIRECTS = 5
 

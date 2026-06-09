@@ -97,15 +97,21 @@ RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILD_TIME
 #   - GLM_OCR_HOST     -> the external GLM OCR box (its own GPU)
 #   - RQ_WORKERS       -> bounds concurrent OCR calls into the GLM box
 #
-# CPU detection tuning (no GPU) — sized for an 8 vCPU / 32 GB host:
-#   YOLO inference runs on CPU and parallelises via OpenMP/MKL threads. To get
-#   fast detection WITHOUT oversubscribing the 8 cores, we run 2 gunicorn
-#   workers each pinned to 4 inference threads (2 x 4 = 8). That serves up to 2
-#   concurrent video streams at full speed; a 3rd queues rather than thrashing.
-#   Each worker preloads the YOLO weights (~4-5 GB RSS), so 2 workers ~= 10 GB —
-#   well within 32 GB. For ABSOLUTE single-video speed set WEB_CONCURRENCY=1 +
-#   OMP_NUM_THREADS=8 (one stream uses all 8 cores). The *_NUM_THREADS vars must
-#   be process env (set here) because torch reads them at import.
+# CPU detection tuning (no GPU). VIDEO detection runs in the `detection` RQ
+# worker now (NOT gunicorn), so size it there. Two knobs interact, and their
+# product must not exceed your core count or YOLO threads thrash and get SLOWER:
+#       DETECTION_WORKERS  x  OMP_NUM_THREADS  ~=  vCPUs
+#   - DETECTION_WORKERS  = how many videos process in parallel.
+#   - OMP/MKL/OPENBLAS_NUM_THREADS = CPU threads per YOLO inference.
+#   Throughput (many videos):  e.g. 16 vCPU -> DETECTION_WORKERS=4, OMP=4.
+#   Fastest single video:      e.g. 16 vCPU -> DETECTION_WORKERS=2, OMP=8
+#                              (past ~8 threads YOLO barely scales — bandwidth-bound).
+#   Each detection worker lazy-loads only the weight a job needs (rqworker skips
+#   the preload); gunicorn still preloads all weights per worker (~4-5 GB each)
+#   for the image endpoint — set SKIP_MODEL_PRELOAD=1 to make it lazy and reclaim
+#   that RAM. The *_NUM_THREADS vars must be process env (torch reads them at
+#   import) and apply to BOTH gunicorn and the worker. The defaults below are a
+#   safe 1-worker baseline; override DETECTION_WORKERS/OMP_* in the deploy env.
 ENV DJANGO_SETTINGS_MODULE=detector.settings \
     ALLOWED_HOSTS=* \
     DEBUG=False \
