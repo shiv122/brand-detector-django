@@ -9,6 +9,7 @@ from apps.services.classification.classification_service import ClassificationSe
 from apps.services.counting.counting_service import CountingService
 from apps.services.detection.detection_service import DetectionService
 from apps.services.ocr.ocr_service import OcrService
+from apps.services.ocr.locate_service import LocateService
 from apps.services.storage import SpacesService
 
 # Initialize services once - shared across all controllers
@@ -24,6 +25,9 @@ _spaces_service = SpacesService(_config)
 # (when enabled per request) by the detection path to OCR each frame during
 # video processing.
 _ocr_service = OcrService(_config)
+# LocateAnything: the second, selectable OCR engine (bounding boxes). Available
+# only when LOCATE_HOST is set.
+_locate_service = LocateService(_config)
 _detection_service = DetectionService(
     _config,
     _model_service,
@@ -32,5 +36,6 @@ _detection_service = DetectionService(
     _counting_service,
     _spaces_service,
     _ocr_service,
+    _locate_service,
 )
 

@@ -64,6 +64,33 @@ class AppConfig:
             ),
         )
 
+        # External LocateAnything box (visual grounding → bounding boxes). A
+        # second, selectable OCR "engine"; point LOCATE_HOST at the deployed
+        # locate-anything-service. Empty host => engine unavailable.
+        self.locate_host: str = getattr(settings, "LOCATE_HOST", "")
+        self.locate_timeout_seconds: float = float(
+            getattr(settings, "LOCATE_TIMEOUT_SECONDS", 180)
+        )
+        self.locate_default_task: str = (
+            str(getattr(settings, "LOCATE_DEFAULT_TASK", "ocr")).strip().lower()
+            or "ocr"
+        )
+        self.locate_default_query: str = getattr(
+            settings, "LOCATE_DEFAULT_QUERY", "brands, logos, texts"
+        )
+        self.locate_mode: str = str(
+            getattr(settings, "LOCATE_MODE", "hybrid")
+        ).strip().lower()
+        self.locate_max_new_tokens: int = int(
+            getattr(settings, "LOCATE_MAX_NEW_TOKENS", 0)
+        )
+        # Tesseract page-segmentation mode for the "tesseract" reader (6 = block).
+        self.locate_tesseract_psm: int = int(
+            getattr(settings, "LOCATE_TESSERACT_PSM", 6)
+        )
+        # Pixels added on every side when cropping a detection box for OCR.
+        self.locate_crop_pad: int = int(getattr(settings, "LOCATE_CROP_PAD", 5))
+
         # Stage-2 formatter provider switch: "deepseek" | "gemini".
         self.text_formatter_provider: str = str(
             getattr(settings, "TEXT_FORMATTER_PROVIDER", "deepseek")

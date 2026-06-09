@@ -256,6 +256,21 @@ GLM_OCR_EXTRACT_PROMPT = os.getenv(
     "layout, line breaks, and reading order. Return only the extracted text.",
 )
 
+# External LocateAnything service (its own GPU). FastAPI /locate endpoint that
+# fetches the image URL itself and returns bounding boxes — a second, selectable
+# OCR "engine" alongside GLM. Empty LOCATE_HOST => the engine is unavailable.
+# Retry knobs: LOCATE_RETRIES / LOCATE_RETRY_BASE_DELAY (read by the client).
+LOCATE_HOST = os.getenv("LOCATE_HOST", "").strip()
+LOCATE_TIMEOUT_SECONDS = float(os.getenv("LOCATE_TIMEOUT_SECONDS", "180"))
+LOCATE_DEFAULT_TASK = os.getenv("LOCATE_DEFAULT_TASK", "ocr").strip().lower() or "ocr"
+LOCATE_DEFAULT_QUERY = os.getenv("LOCATE_DEFAULT_QUERY", "brands, logos, texts")
+LOCATE_MODE = os.getenv("LOCATE_MODE", "hybrid").strip().lower()
+LOCATE_MAX_NEW_TOKENS = int(os.getenv("LOCATE_MAX_NEW_TOKENS", "0"))
+# Tesseract page-segmentation mode for the LocateAnything "tesseract" reader.
+LOCATE_TESSERACT_PSM = int(os.getenv("LOCATE_TESSERACT_PSM", "6"))
+# Pixels added on every side when cropping a detection box for OCR readers.
+LOCATE_CROP_PAD = int(os.getenv("LOCATE_CROP_PAD", "5"))
+
 # Stage-2 text formatter provider — "deepseek" (default) or "gemini".
 # Both turn raw GLM-OCR text into the prompted JSON shape; gemini is faster.
 TEXT_FORMATTER_PROVIDER = os.getenv("TEXT_FORMATTER_PROVIDER", "deepseek").strip().lower() or "deepseek"

@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 
 
 _OCR_SERVICE = None
+_LOCATE_SERVICE = None
 
 # Fields the UI / exports actually read off a stored OCR result. Everything
 # else the engine produces is debug-only and just bloats Redis + the DB +
@@ -37,6 +38,16 @@ _RESULT_KEEP_KEYS = frozenset({
     "deepseek_text_model",
     "gemini_text_id",
     "gemini_text_model",
+    # LocateAnything engine results: bounding boxes in original-frame pixels.
+    # `image_size` is {width,height,...} dims (NOT bytes — avoids the image strip).
+    "engine",
+    "task",
+    "query",
+    "reader",
+    "boxes",
+    "points",
+    "image_size",
+    "model",
 })
 
 # Defence-in-depth: keys that could ever carry image bytes/base64. The OCR
@@ -93,23 +104,43 @@ def _load_service():
     return _OCR_SERVICE
 
 
+def _load_locate_service():
+    """Build a LocateService directly (same fork-safety rationale as above)."""
+    global _LOCATE_SERVICE
+    if _LOCATE_SERVICE is None:
+        from apps.services.ocr.locate_service import LocateService
+        from config.app_config import AppConfig
+
+        _LOCATE_SERVICE = LocateService(AppConfig())
+    return _LOCATE_SERVICE
+
+
 def run_ocr_from_url(
     image_url: str,
     prompt: str,
     prompt_meta: Optional[Dict[str, Any]] = None,
     frame_id: Optional[int] = None,
+    engine: str = "glm",
+    task: str = "",
+    query: str = "",
+    reader: str = "",
 ) -> Dict[str, Any]:
-    """Worker entry point: hand the image URL to the GLM OCR service.
+    """Worker entry point: hand the image URL to the chosen OCR engine.
 
-    `frame_id` (when present) makes the worker also persist the OCR result
-    onto the matching Frame row so the dashboard can hydrate from DB on
-    reload — the Redis result is the realtime channel, the DB the durable copy.
+    `engine` selects GLM (text extraction, default) or LocateAnything bounding
+    boxes ("locate"); for "locate", `task`/`query` stand in for the text prompt
+    and `reader` chooses how box text is filled (tesseract / locate / none).
+    `frame_id` (when present) makes the worker also persist the result onto the
+    matching Frame row so the dashboard can hydrate from DB on reload — the
+    Redis result is the realtime channel, the DB the durable copy.
     """
     if not image_url:
         return {"error": "no image_url provided", "prompt": prompt}
 
-    service = _load_service()
-    result = service.run(image_url, prompt)
+    if (engine or "glm").strip().lower() == "locate":
+        result = _load_locate_service().run(image_url, task=task, query=query, reader=reader)
+    else:
+        result = _load_service().run(image_url, prompt)
     if prompt_meta:
         result["prompt_meta"] = prompt_meta
 

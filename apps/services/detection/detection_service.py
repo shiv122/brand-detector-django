@@ -99,6 +99,7 @@ class DetectionService:
         counting_service: Optional[CountingService] = None,
         spaces_service=None,
         ocr_service=None,
+        locate_service=None,
     ):
         self.config = config
         self.model_service = model_service
@@ -107,6 +108,7 @@ class DetectionService:
         self.counting_service = counting_service
         self.spaces_service = spaces_service
         self.ocr_service = ocr_service
+        self.locate_service = locate_service
         self.csv_dir = Path(self.config.static_dir) / "csv_reports"
 
         # Ensure directories exist
@@ -210,23 +212,50 @@ class DetectionService:
             cv2.imwrite(str(frame_path), annotated_frame)
         return f"/static/frames/{frame_filename}", "", str(frame_path)
 
-    def _resolve_ocr_prompt(
-        self, source: Optional[dict]
-    ) -> Optional[Tuple[str, dict]]:
-        """Resolve an OCR prompt + metadata from the validated request data.
+    def _resolve_ocr_prompt(self, source: Optional[dict]) -> Optional[dict]:
+        """Resolve the per-video OCR config from the validated request.
 
-        Returns (prompt_text, prompt_meta) or None when no OCR is requested
-        / no matching prompt can be found. Priority: inline `prompt` >
-        `prompt_slug` > `sport`.
+        Returns an engine-aware dict, or None when OCR can't run:
+          glm    -> {"engine": "glm", "prompt": <text>, "meta": {...}}
+          locate -> {"engine": "locate", "task": <t>, "query": <q>, "meta": {...}}
+
+        For GLM the text prompt resolves by priority: inline `prompt` >
+        `prompt_slug` > `sport`. LocateAnything needs no sport prompt — just a
+        task + query (defaults filled in by the service when blank).
         """
         if not source:
             return None
+
+        engine = (source.get("ocr_engine") or "glm").strip().lower()
+        if engine == "locate":
+            task = (source.get("ocr_task") or "").strip().lower()
+            query = (source.get("ocr_query") or "").strip()
+            reader = (source.get("ocr_reader") or "").strip().lower()
+            meta = {"engine": "locate", "source": "locate"}
+            if task:
+                meta["task"] = task
+            if query:
+                meta["query"] = query
+            if reader:
+                meta["reader"] = reader
+            return {
+                "engine": "locate",
+                "task": task,
+                "query": query,
+                "reader": reader,
+                "meta": meta,
+            }
+
         inline = (source.get("prompt") or "").strip()
         slug = (source.get("prompt_slug") or "").strip()
         sport = (source.get("sport") or "").strip()
 
         if inline:
-            return render_prompt(inline, []), {"source": "inline"}
+            return {
+                "engine": "glm",
+                "prompt": render_prompt(inline, []),
+                "meta": {"source": "inline"},
+            }
 
         if slug:
             sp = SportPrompt.objects.filter(slug=slug).first()
@@ -240,7 +269,7 @@ class DetectionService:
                 }
                 if brands:
                     meta["allowed_brands"] = brands
-                return render_prompt(sp.prompt, brands), meta
+                return {"engine": "glm", "prompt": render_prompt(sp.prompt, brands), "meta": meta}
 
         if sport:
             sport_lower = sport.lower()
@@ -260,7 +289,7 @@ class DetectionService:
                 }
                 if brands:
                     meta["allowed_brands"] = brands
-                return render_prompt(sp.prompt, brands), meta
+                return {"engine": "glm", "prompt": render_prompt(sp.prompt, brands), "meta": meta}
         return None
 
     def update_config(self, data: dict) -> Response:
@@ -676,15 +705,24 @@ class DetectionService:
         """Process video and stream results via SSE"""
         # OCR runs per-frame only when the request opted in (resolved prompt)
         # and the external GLM OCR endpoint is configured.
-        ocr_active = bool(
-            ocr_resolution
-            and self.ocr_service
-            and self.ocr_service.is_available()
-        )
+        ocr_engine = (ocr_resolution or {}).get("engine", "glm")
+        if ocr_engine == "locate":
+            ocr_active = bool(
+                ocr_resolution
+                and self.locate_service
+                and self.locate_service.is_available()
+            )
+        else:
+            ocr_active = bool(
+                ocr_resolution
+                and self.ocr_service
+                and self.ocr_service.is_available()
+            )
         # Prepare settings in JSON format
         settings = {
             "enable_classification": enable_classification,
             "enable_ocr": ocr_active,
+            "ocr_engine": ocr_engine if ocr_active else None,
             "create_video": create_video,
             "model_weight": weight_name or self.get_current_weight(),
         }
@@ -858,23 +896,34 @@ class DetectionService:
                         # to Spaces so the external GLM box can fetch it by URL.
                         ocr_job_info: Optional[dict] = None
                         if ocr_active:
-                            prompt, meta = ocr_resolution
                             ok_raw, raw_buf = cv2.imencode(".jpg", frame)
                             raw_bytes = raw_buf.tobytes() if ok_raw else b""
                             ocr_url, _, _ = self._store_frame_image(
                                 f"ocr_{frame_filename}", raw_bytes, frame
                             )
                             if ocr_url.startswith(("http://", "https://")):
-                                ocr_job_info = enqueue_ocr_job(
-                                    image_url=ocr_url,
-                                    prompt=prompt,
-                                    prompt_meta=meta,
-                                    frame_id=db_frame.id,
-                                )
+                                if ocr_engine == "locate":
+                                    ocr_job_info = enqueue_ocr_job(
+                                        image_url=ocr_url,
+                                        prompt="",
+                                        prompt_meta=ocr_resolution.get("meta"),
+                                        frame_id=db_frame.id,
+                                        engine="locate",
+                                        task=ocr_resolution.get("task", ""),
+                                        query=ocr_resolution.get("query", ""),
+                                        reader=ocr_resolution.get("reader", ""),
+                                    )
+                                else:
+                                    ocr_job_info = enqueue_ocr_job(
+                                        image_url=ocr_url,
+                                        prompt=ocr_resolution.get("prompt", ""),
+                                        prompt_meta=ocr_resolution.get("meta"),
+                                        frame_id=db_frame.id,
+                                    )
                             else:
-                                # No public URL (Spaces unconfigured) — GLM can't
-                                # fetch a local path, so surface it rather than
-                                # silently dropping the OCR request.
+                                # No public URL (Spaces unconfigured) — the OCR
+                                # box can't fetch a local path, so surface it
+                                # rather than silently dropping the request.
                                 ocr_job_info = {
                                     "status": "unavailable",
                                     "error": "Spaces not configured; OCR needs a public frame URL.",

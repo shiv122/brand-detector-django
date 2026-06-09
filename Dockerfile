@@ -29,9 +29,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   libgl1/libglib2.0-0 — opencv-python   libgomp1 — torch/ultralytics
 #   tini/supervisor      — process mgmt    curl/ca-certificates — install uv
 #   nginx                — public reverse proxy + /static/ file serving
+#   tesseract-ocr        — local OCR for the LocateAnything "tesseract" reader
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl tini supervisor \
-        libgl1 libglib2.0-0 libgomp1 nginx \
+        libgl1 libglib2.0-0 libgomp1 nginx tesseract-ocr \
     && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
 
 # uv (manages the venv).
@@ -115,11 +116,11 @@ ENV DJANGO_SETTINGS_MODULE=detector.settings \
     PORT=8000 \
     GUNICORN_PORT=8001 \
     WEB_CONCURRENCY=2 \
-    GUNICORN_THREADS=8 \
+    GUNICORN_THREADS=12 \
     GUNICORN_TIMEOUT=3600 \
-    OMP_NUM_THREADS=4 \
-    MKL_NUM_THREADS=4 \
-    OPENBLAS_NUM_THREADS=4 \
+    OMP_NUM_THREADS=6 \
+    MKL_NUM_THREADS=6 \
+    OPENBLAS_NUM_THREADS=6 \
     RQ_WORKERS=4 \
     RQ_OCR_TIMEOUT=600 \
     RQ_RESULT_TTL=7200 \

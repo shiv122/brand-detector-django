@@ -20,7 +20,12 @@ from apps.api.v1.requests.ocr_requests import (
     OcrRunRequest,
     SportPromptUpsertRequest,
 )
-from apps.api.v1.shared_services import _config, _ocr_service, _spaces_service
+from apps.api.v1.shared_services import (
+    _config,
+    _locate_service,
+    _ocr_service,
+    _spaces_service,
+)
 from apps.core.models import Frame, SportPrompt
 from apps.services.ocr.ocr_queue import enqueue_ocr_job, fetch_jobs
 from apps.utils.prompt_render import render_prompt
@@ -189,27 +194,38 @@ def run_ocr(request):
     data = validation.validated()
 
     file = request.FILES["file"]
-    prompt, prompt_meta, err = _resolve_prompt(
-        data.get("prompt"), data.get("prompt_slug"), data.get("sport")
-    )
-    if err is not None:
-        return err
+    engine = (request.data.get("engine") or "glm").strip().lower()
 
-    if not _ocr_service.is_available():
-        return Response(
-            {"error": "GLM OCR endpoint is not configured — set GLM_OCR_HOST."},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+    # Resolve engine + its inputs before doing any upload.
+    if engine == "locate":
+        if not _locate_service.is_available():
+            return Response(
+                {"error": "LocateAnything endpoint is not configured — set LOCATE_HOST."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        prompt, prompt_meta = None, {"engine": "locate"}
+    else:
+        prompt, prompt_meta, err = _resolve_prompt(
+            data.get("prompt"), data.get("prompt_slug"), data.get("sport")
         )
+        if err is not None:
+            return err
+        if not _ocr_service.is_available():
+            return Response(
+                {"error": "GLM OCR endpoint is not configured — set GLM_OCR_HOST."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
     if not _spaces_service.is_configured():
         return Response(
             {
                 "error": "Spaces is not configured — needed to host the upload "
-                "for the GLM OCR service to fetch. Set the DO_* env vars."
+                "for the OCR service to fetch. Set the DO_* env vars."
             },
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
-    # GLM OCR fetches by URL, so push the upload to Spaces first, then hand
+    # The OCR engines fetch by URL, so push the upload to Spaces first, then hand
     # over its public URL.
     import uuid
 
@@ -225,7 +241,15 @@ def run_ocr(request):
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    result = _ocr_service.run(image_url, prompt)
+    if engine == "locate":
+        result = _locate_service.run(
+            image_url,
+            task=(request.data.get("task") or ""),
+            query=(request.data.get("query") or ""),
+            reader=(request.data.get("reader") or ""),
+        )
+    else:
+        result = _ocr_service.run(image_url, prompt)
     result["prompt_meta"] = prompt_meta
     result["image_url"] = image_url
     return Response(result)
@@ -416,6 +440,35 @@ def enqueue_frame_ocr(request):
             },
             status=status.HTTP_409_CONFLICT,
         )
+
+    engine = (data.get("engine") or "glm").strip().lower()
+    if engine == "locate":
+        if not _locate_service.is_available():
+            return Response(
+                {"error": "LocateAnything endpoint is not configured — set LOCATE_HOST."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        task = (data.get("task") or "").strip()
+        query = (data.get("query") or "").strip()
+        reader = (data.get("reader") or "").strip()
+        meta = {"engine": "locate", "source": "locate"}
+        if task:
+            meta["task"] = task
+        if query:
+            meta["query"] = query
+        if reader:
+            meta["reader"] = reader
+        job = enqueue_ocr_job(
+            image_url=image_url,
+            prompt="",
+            prompt_meta=meta,
+            frame_id=frame.id,
+            engine="locate",
+            task=task,
+            query=query,
+            reader=reader,
+        )
+        return Response({"ocr_job": job, "frame_id": frame.id, "prompt_meta": meta})
 
     prompt, prompt_meta, err = _resolve_prompt(
         data.get("prompt"), data.get("prompt_slug"), data.get("sport")

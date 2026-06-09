@@ -54,8 +54,16 @@ def enqueue_ocr_job(
     prompt: str,
     prompt_meta: Optional[Dict[str, Any]] = None,
     frame_id: Optional[int] = None,
+    engine: str = "glm",
+    task: str = "",
+    query: str = "",
+    reader: str = "",
 ) -> Dict[str, Any]:
     """Enqueue an OCR run for an image URL. Returns a dict for the client.
+
+    `engine` picks the OCR backend: "glm" (text extraction, default) or
+    "locate" (LocateAnything bounding boxes); for "locate", `task`/`query`
+    replace the text prompt.
 
     Shape:
         { "id": <rq job id>, "status": "queued" }
@@ -75,6 +83,10 @@ def enqueue_ocr_job(
             prompt,
             prompt_meta,
             frame_id,
+            engine,
+            task,
+            query,
+            reader,
             **enqueue_kwargs,
         )
         return {"id": job.id, "status": "queued"}

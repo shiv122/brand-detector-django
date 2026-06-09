@@ -102,3 +102,16 @@ class DetectVideoRequest(BaseRequest):
 
         if "prompt" in self.data:
             self._string("prompt", min_length=1, max_length=10000)
+
+        # OCR engine selector: "glm" (text extraction, default) or "locate"
+        # (LocateAnything bounding boxes). For "locate", `ocr_task` (detection /
+        # ocr / grounding…) and `ocr_query` (comma-separated targets) stand in
+        # for the text prompt.
+        if "ocr_engine" in self.data:
+            self._string("ocr_engine", min_length=1, max_length=32)
+        if "ocr_task" in self.data:
+            self._string("ocr_task", min_length=1, max_length=32)
+        if "ocr_query" in self.data:
+            self._string("ocr_query", min_length=1, max_length=2000)
+        if "ocr_reader" in self.data:
+            self._string("ocr_reader", min_length=1, max_length=32)
