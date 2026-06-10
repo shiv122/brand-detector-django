@@ -17,6 +17,9 @@ from drf_spectacular.types import OpenApiTypes
 from django.db.models import Count, Avg, Prefetch, Q
 
 from apps.core.models import ProcessingSession, Frame, Detection, Classification
+from apps.api.v1.controllers.ocr import _resolve_prompt
+from apps.api.v1.shared_services import _ocr_service
+from apps.services.ocr.ocr_queue import enqueue_ocr_job
 
 
 def optional_slash_path(route, view, name=None):
@@ -246,6 +249,116 @@ def session_detail(request, session_id):
     )
 
 
+@extend_schema(
+    summary="Resume / run OCR for a session's frames",
+    description=(
+        "Enqueues OCR for every stored frame in this session that has no "
+        "successful OCR result yet — i.e. frames whose ocr_summary is missing "
+        "or holds an error. This resumes from the last frame where OCR "
+        "succeeded; if OCR never ran, every frame is queued. The run's "
+        "original OCR prompt (stored in run_params) is reused. Pass "
+        "`prompt` / `prompt_slug` / `sport` to override it, or to supply one "
+        "when the run had no OCR configured. Results are written back to "
+        "Frame.ocr_summary and are pollable via /ocr/jobs."
+    ),
+    parameters=[
+        OpenApiParameter(name="session_id", type=OpenApiTypes.STR, location=OpenApiParameter.PATH),
+    ],
+)
+@api_view(["POST"])
+def resume_session_ocr(request, session_id):
+    try:
+        session = ProcessingSession.objects.get(session_id=session_id)
+    except ProcessingSession.DoesNotExist:
+        return Response({"error": "Session not found"}, status=404)
+
+    if not _ocr_service.is_available():
+        return Response(
+            {"error": "GLM OCR endpoint is not configured — set GLM_OCR_HOST."},
+            status=503,
+        )
+
+    data = request.data or {}
+    params = session.run_params or {}
+
+    # Prompt resolution: an explicit override in the body wins; otherwise reuse
+    # the prompt the run was started with (persisted in run_params). A run that
+    # never had OCR configured has no stored prompt, so the caller must supply
+    # one.
+    override = any(
+        (data.get("prompt"), data.get("prompt_slug"), data.get("sport"))
+    )
+    if override:
+        prompt, prompt_meta, err = _resolve_prompt(
+            data.get("prompt"), data.get("prompt_slug"), data.get("sport")
+        )
+        if err is not None:
+            return err
+    else:
+        prompt = params.get("ocr_prompt")
+        prompt_meta = params.get("ocr_meta") or {}
+        if not prompt:
+            return Response(
+                {
+                    "error": "this run has no stored OCR prompt — pass "
+                    "prompt / prompt_slug / sport to run OCR."
+                },
+                status=422,
+            )
+
+    # Frames that still need OCR: no result yet, or a previous error result.
+    # Ordering by frame_number isn't required for correctness (jobs run
+    # concurrently) but keeps the enqueue order intuitive.
+    needs = (
+        session.frames.all()
+        .filter(Q(ocr_summary__isnull=True) | Q(ocr_summary__has_key="error"))
+        .order_by("frame_number")
+    )
+
+    enqueued = 0
+    skipped_no_url = 0
+    job_ids: list[str] = []
+    to_update: list[Frame] = []
+    for frame in needs.iterator():
+        url = frame.frame_url or ""
+        # GLM OCR fetches by URL, so a frame stored only on local disk can't be
+        # OCR'd remotely — skip it rather than enqueue a job that will fail.
+        if not url.startswith(("http://", "https://")):
+            skipped_no_url += 1
+            continue
+        job = enqueue_ocr_job(
+            image_url=url, prompt=prompt, prompt_meta=prompt_meta, frame_id=frame.id
+        )
+        jid = (job or {}).get("id")
+        if jid:
+            job_ids.append(jid)
+            frame.ocr_job_id = jid
+            to_update.append(frame)
+            enqueued += 1
+
+    if to_update:
+        Frame.objects.bulk_update(to_update, ["ocr_job_id"], batch_size=500)
+
+    # Persist the prompt + enable flag so subsequent resumes work and the
+    # sessions list/badge reflects OCR being active for this run.
+    if enqueued and (override or not params.get("enable_ocr")):
+        params["enable_ocr"] = True
+        params["ocr_prompt"] = prompt
+        params["ocr_meta"] = prompt_meta
+        session.run_params = params
+        session.save(update_fields=["run_params", "updated_at"])
+
+    return Response(
+        {
+            "session_id": session.session_id,
+            "enqueued": enqueued,
+            "skipped_no_url": skipped_no_url,
+            "ocr_job_ids": job_ids,
+            "prompt_meta": prompt_meta,
+        }
+    )
+
+
 def _ocr_raw_text(ocr_summary) -> str:
     """Extract a flat string of OCR raw text from the stored ocr_summary JSON."""
     if not isinstance(ocr_summary, dict):
@@ -435,6 +548,11 @@ urlpatterns = [
         r"session/(?P<session_id>[^/]+)/export-xlsx",
         export_session_xlsx,
         name="session-export-xlsx",
+    ),
+    *optional_slash_path(
+        r"session/(?P<session_id>[^/]+)/resume-ocr",
+        resume_session_ocr,
+        name="session-resume-ocr",
     ),
     *optional_slash_path(
         r"xlsx-files/download/(?P<filename>[^/]+)",
