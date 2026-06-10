@@ -12,7 +12,7 @@ from apps.api.v1.requests.classification_requests import (
 )
 
 # Import shared services (initialized once to prevent duplicate logs)
-from apps.api.v1.shared_services import _classification_service
+from apps.api.v1.shared_services import _classification_service, _detection_service
 
 
 def optional_slash_path(route, view, name=None):
@@ -44,11 +44,13 @@ def health(request):
 
 @api_view(["GET"])
 def weights(request):
-    """Get list of available classification weights"""
+    """Get list of available classification weights (from the external detector
+    box when DETECTOR_HOST is set, else local)."""
+    available, default = _detection_service.available_classification_weights()
     return Response(
         {
-            "available_weights": _classification_service.get_available_weights(),
-            "default_weight": _classification_service.get_current_weight(),
+            "available_weights": available,
+            "default_weight": default,
         }
     )
 

@@ -98,12 +98,17 @@ def run_ocr_from_url(
     prompt: str,
     prompt_meta: Optional[Dict[str, Any]] = None,
     frame_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+    frame_number: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Worker entry point: hand the image URL to the GLM OCR service.
 
-    `frame_id` (when present) makes the worker also persist the OCR result
-    onto the matching Frame row so the dashboard can hydrate from DB on
-    reload — the Redis result is the realtime channel, the DB the durable copy.
+    The result is persisted onto the matching Frame row so the dashboard can
+    hydrate from DB on reload (the Redis result is the realtime channel, the DB
+    the durable copy). The frame is located by `frame_id` when given, else by
+    `(session_id, frame_number)` — the latter lets the detection path enqueue
+    OCR before the Frame row exists (the row is created within a few hundred ms,
+    well before this GLM call returns).
     """
     if not image_url:
         return {"error": "no image_url provided", "prompt": prompt}
@@ -117,11 +122,23 @@ def run_ocr_from_url(
     # Redis or the DB. The sync /ocr/run path keeps the full result.
     result = _slim_result(result)
 
-    if frame_id is not None:
+    if frame_id is not None or (session_id is not None and frame_number is not None):
         try:
             from apps.core.models import Frame
 
-            Frame.objects.filter(id=frame_id).update(ocr_summary=result)
+            if frame_id is not None:
+                updated = Frame.objects.filter(id=frame_id).update(ocr_summary=result)
+            else:
+                updated = Frame.objects.filter(
+                    session__session_id=session_id, frame_number=frame_number
+                ).update(ocr_summary=result)
+            if not updated:
+                # Frame not committed yet (rare: GLM faster than the detect call).
+                # The realtime job result still carries the OCR; only the durable
+                # DB copy is missed for this frame.
+                result.setdefault("warnings", []).append(
+                    "frame row not found when persisting ocr_summary"
+                )
         except Exception as exc:  # noqa: BLE001 - never fail the job over DB hiccups
             result.setdefault("warnings", []).append(
                 f"failed to persist ocr_summary: {exc}"

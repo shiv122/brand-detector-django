@@ -54,12 +54,19 @@ def enqueue_ocr_job(
     prompt: str,
     prompt_meta: Optional[Dict[str, Any]] = None,
     frame_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+    frame_number: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Enqueue an OCR run for an image URL. Returns a dict for the client.
 
     Shape:
         { "id": <rq job id>, "status": "queued" }
         { "status": "unavailable", "error": "<reason>" }   on failure
+
+    The worker persists the result onto a Frame row. Pass EITHER `frame_id`
+    (when the row already exists) OR `(session_id, frame_number)` — the latter
+    lets the detection path enqueue OCR *before* the Frame row is committed, so
+    OCR runs concurrently with the detection call instead of waiting for it.
     """
     try:
         import django_rq
@@ -75,6 +82,8 @@ def enqueue_ocr_job(
             prompt,
             prompt_meta,
             frame_id,
+            session_id,
+            frame_number,
             **enqueue_kwargs,
         )
         return {"id": job.id, "status": "queued"}

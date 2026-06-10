@@ -118,11 +118,13 @@ def config(request):
 )
 @api_view(["GET"])
 def weights(request):
-    """Get list of available weights"""
+    """Get list of available weights (from the external detector box when
+    DETECTOR_HOST is set, else local)."""
+    available, default = _detection_service.available_detection_weights()
     return Response(
         {
-            "available_weights": _detection_service.get_available_weights(),
-            "default_weight": _detection_service.get_current_weight(),
+            "available_weights": available,
+            "default_weight": default,
         }
     )
 

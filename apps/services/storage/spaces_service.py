@@ -10,6 +10,8 @@ DO_* env is unset, `is_configured()` is False and detection falls back to local
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from urllib.parse import urlsplit
 
 from config.app_config import AppConfig
@@ -21,6 +23,10 @@ class SpacesService:
     def __init__(self, config: AppConfig):
         self.config = config
         self._client = None
+        # Guards lazy client creation: the detection worker uploads frames from
+        # many threads at once (DETECTOR_FRAME_CONCURRENCY), and concurrent
+        # boto3.client() creation off the default session is not thread-safe.
+        self._client_lock = threading.Lock()
         self._public_base = self._compute_public_base()
 
     def is_configured(self) -> bool:
@@ -44,21 +50,32 @@ class SpacesService:
 
     @property
     def client(self):
+        # Double-checked lock: build the shared client once, even when many
+        # upload threads race here on the first frame. A boto3 client IS safe to
+        # call concurrently; only its *creation* needs to be serialized.
         if self._client is None:
-            import boto3
-            from botocore.config import Config as BotoConfig
+            with self._client_lock:
+                if self._client is None:
+                    import boto3
+                    from botocore.config import Config as BotoConfig
 
-            self._client = boto3.client(
-                "s3",
-                endpoint_url=self.config.spaces_endpoint,
-                region_name=self.config.spaces_region or None,
-                aws_access_key_id=self.config.spaces_access_key_id,
-                aws_secret_access_key=self.config.spaces_secret_access_key,
-                config=BotoConfig(
-                    s3={"addressing_style": "virtual"},
-                    retries={"max_attempts": 3, "mode": "standard"},
-                ),
-            )
+                    # Size the HTTP connection pool to the upload concurrency so
+                    # parallel PUTs don't queue on a too-small pool (boto3
+                    # default is 10). Defaults comfortably above
+                    # DETECTOR_FRAME_CONCURRENCY; raise both together if needed.
+                    max_pool = max(10, int(os.getenv("SPACES_MAX_POOL_CONNECTIONS", "32")))
+                    self._client = boto3.client(
+                        "s3",
+                        endpoint_url=self.config.spaces_endpoint,
+                        region_name=self.config.spaces_region or None,
+                        aws_access_key_id=self.config.spaces_access_key_id,
+                        aws_secret_access_key=self.config.spaces_secret_access_key,
+                        config=BotoConfig(
+                            s3={"addressing_style": "virtual"},
+                            retries={"max_attempts": 3, "mode": "standard"},
+                            max_pool_connections=max_pool,
+                        ),
+                    )
         return self._client
 
     def public_url(self, key: str) -> str:

@@ -256,6 +256,23 @@ GLM_OCR_EXTRACT_PROMPT = os.getenv(
     "layout, line breaks, and reading order. Return only the extracted text.",
 )
 
+# External detector service (its own GPU) — detection + classification. When
+# DETECTOR_HOST is set, video frames are detected+classified by the remote box
+# (see apps/services/detection/remote_detection_client.py) instead of the
+# in-process YOLO. Empty => fall back to local detection (weights baked in the
+# image). The frame is uploaded to Spaces and only its URL is sent.
+DETECTOR_HOST = os.getenv("DETECTOR_HOST", "").strip().rstrip("/")
+DETECTOR_API_KEY = os.getenv("DETECTOR_API_KEY", "").strip()
+DETECTOR_TIMEOUT_SECONDS = float(os.getenv("DETECTOR_TIMEOUT_SECONDS", "60"))
+DETECTOR_RETRIES = int(os.getenv("DETECTOR_RETRIES", "3"))
+DETECTOR_RETRY_BASE_DELAY = float(os.getenv("DETECTOR_RETRY_BASE_DELAY", "1.0"))
+# How many frames the detection worker processes IN PARALLEL when using the
+# remote box — each frame's S3 uploads + the /detect round-trip overlap, and the
+# detector micro-batches the concurrent calls into one GPU pass. Match it to the
+# detector's BATCH_MAX_SIZE (default 8). Only applies to the remote path; local
+# in-process YOLO stays sequential (one model instance isn't thread-safe).
+DETECTOR_FRAME_CONCURRENCY = int(os.getenv("DETECTOR_FRAME_CONCURRENCY", "8"))
+
 # Stage-2 text formatter provider — "deepseek" (default) or "gemini".
 # Both turn raw GLM-OCR text into the prompted JSON shape; gemini is faster.
 TEXT_FORMATTER_PROVIDER = os.getenv("TEXT_FORMATTER_PROVIDER", "deepseek").strip().lower() or "deepseek"

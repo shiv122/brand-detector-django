@@ -12,6 +12,8 @@ import subprocess
 import shutil
 import csv
 import logging
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Optional, Generator
 from datetime import datetime
@@ -117,6 +119,7 @@ class DetectionService:
         counting_service: Optional[CountingService] = None,
         spaces_service=None,
         ocr_service=None,
+        detector_client=None,
     ):
         self.config = config
         self.model_service = model_service
@@ -125,6 +128,9 @@ class DetectionService:
         self.counting_service = counting_service
         self.spaces_service = spaces_service
         self.ocr_service = ocr_service
+        # When set (DETECTOR_HOST configured), detection + classification run on
+        # the external GPU service instead of the in-process YOLO. None => local.
+        self.detector_client = detector_client
         self.csv_dir = Path(self.config.static_dir) / "csv_reports"
 
         # Ensure directories exist
@@ -152,6 +158,34 @@ class DetectionService:
     def switch_weight(self, weight_name: str) -> bool:
         """Switch to a different weight"""
         return self.model_service.switch_model(weight_name)
+
+    def available_detection_weights(self) -> Tuple[List[dict], Optional[str]]:
+        """(weights, default) for the UI dropdown. Reflects the external box when
+        DETECTOR_HOST is set (single source of truth), else the local weights;
+        falls back to local if the box is briefly unreachable."""
+        if self.detector_client is not None:
+            try:
+                data = self.detector_client.list_detection_weights()
+                return data.get("weights", []), data.get("default")
+            except Exception as e:  # noqa: BLE001 - never break the dropdown
+                logger.warning("detector /weights failed, using local list: %s", e)
+        return self.get_available_weights(), self.get_current_weight()
+
+    def available_classification_weights(self) -> Tuple[List[dict], Optional[str]]:
+        """(weights, default) for the classification dropdown — remote box when
+        configured, else local; local fallback on error."""
+        if self.detector_client is not None:
+            try:
+                data = self.detector_client.list_classification_weights()
+                return data.get("weights", []), data.get("default")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "detector /classification/weights failed, using local list: %s", e
+                )
+        if self.classification_service is not None:
+            return (self.classification_service.get_available_weights(),
+                    self.classification_service.get_current_weight())
+        return [], None
 
     def detect_in_image(
         self, image_data: bytes, confidence_threshold: float = 0.5,
@@ -701,31 +735,36 @@ class DetectionService:
             )
             last_hb = time.monotonic()
             summary_every = 25
-            for index, timestamp, frame in reader:
-                if index in existing:
-                    processed = max(processed, index + 1)
-                    continue
-                self._process_one_frame(
-                    session=session,
-                    frame=frame,
-                    index=index,
-                    timestamp=timestamp,
-                    conf=conf,
-                    weight_name=weight_name,
-                    enable_classification=enable_classification,
-                    classification_weight_name=classification_weight_name,
-                    csv_writer=csv_writer,
-                    csv_file=csv_file,
-                    ocr_active=ocr_active,
-                    ocr_resolution=ocr_resolution,
-                    frame_prefix=frame_prefix,
-                    create_video=create_video,
-                    temp_frames_dir=temp_frames_dir,
-                )
-                processed = index + 1
+
+            # Parallelism: when detection runs on the remote box, process several
+            # frames at once — each frame's S3 uploads + the /detect round-trip
+            # overlap, and the detector micro-batches the concurrent calls into
+            # one GPU pass. The SLOW I/O runs in worker threads (_prepare_frame,
+            # which touches no DB); the DB commit (_commit_frame) happens on THIS
+            # thread in strict frame order, so rows stay in sequence and there are
+            # no cross-thread DB/CSV races. Local in-process YOLO stays sequential
+            # (a single model instance isn't safe to call from many threads).
+            from django.conf import settings as _settings
+            concurrency = (
+                max(1, int(getattr(_settings, "DETECTOR_FRAME_CONCURRENCY", 8)))
+                if self.detector_client is not None else 1
+            )
+            prep_kwargs = dict(
+                session=session, conf=conf, weight_name=weight_name,
+                enable_classification=enable_classification,
+                classification_weight_name=classification_weight_name,
+                ocr_active=ocr_active, ocr_resolution=ocr_resolution,
+                frame_prefix=frame_prefix, create_video=create_video,
+                temp_frames_dir=temp_frames_dir,
+            )
+
+            def _after_frame(done_through: int) -> bool:
+                """Heartbeat + cancel-check + periodic summary. Returns True if an
+                external cancel landed (caller should stop)."""
+                nonlocal last_hb
                 now = time.monotonic()
                 if now - last_hb >= 2.0:
-                    session.touch_heartbeat(processed_frames=processed)
+                    session.touch_heartbeat(processed_frames=done_through)
                     last_hb = now
                     # Honor an external cancel. cancel_session flips status away
                     # from PROCESSING; touch_heartbeat above only writes
@@ -738,12 +777,67 @@ class DetectionService:
                     if live_status != ProcessingStatus.PROCESSING.value:
                         logger.info(
                             "Detection CANCELLED session=%s at frame=%s (status=%s)",
-                            session_id, processed, live_status,
+                            session_id, done_through, live_status,
                         )
+                        return True
+                if done_through % summary_every == 0 and self.counting_service:
+                    self.counting_service.finalize_session(session_id)
+                return False
+
+            if concurrency == 1:
+                # Sequential (local detection): prepare + commit inline, in order.
+                for index, timestamp, frame in reader:
+                    if index in existing:
+                        processed = max(processed, index + 1)
+                        continue
+                    prepared = self._prepare_frame(
+                        frame=frame, index=index, timestamp=timestamp, **prep_kwargs
+                    )
+                    self._commit_frame(session, prepared, csv_writer, csv_file)
+                    processed = index + 1
+                    if _after_frame(processed):
                         cancelled = True
                         break
-                if processed % summary_every == 0 and self.counting_service:
-                    self.counting_service.finalize_session(session_id)
+            else:
+                # Concurrent (remote detection): keep up to `concurrency` frames in
+                # flight; retire FIFO so commits stay in frame order.
+                pool = ThreadPoolExecutor(
+                    max_workers=concurrency, thread_name_prefix="detframe"
+                )
+                window: deque = deque()
+                try:
+                    for index, timestamp, frame in reader:
+                        if index in existing:
+                            processed = max(processed, index + 1)
+                            continue
+                        window.append((index, pool.submit(
+                            self._prepare_frame,
+                            frame=frame, index=index, timestamp=timestamp,
+                            **prep_kwargs,
+                        )))
+                        if len(window) >= concurrency:
+                            idx, fut = window.popleft()
+                            self._commit_frame(
+                                session, fut.result(), csv_writer, csv_file
+                            )
+                            processed = idx + 1
+                            if _after_frame(processed):
+                                cancelled = True
+                                break
+                    # Drain whatever is still in flight (in order).
+                    while window and not cancelled:
+                        idx, fut = window.popleft()
+                        self._commit_frame(
+                            session, fut.result(), csv_writer, csv_file
+                        )
+                        processed = idx + 1
+                        if _after_frame(processed):
+                            cancelled = True
+                            break
+                finally:
+                    # On cancel/error don't block on in-flight frames; drop the
+                    # queued ones. Running ones finish harmlessly (idempotent).
+                    pool.shutdown(wait=False, cancel_futures=True)
         except (VideoProbeError, FrameReadError) as exc:
             loop_error = f"{type(exc).__name__}: {exc}"
             logger.error("Detection source/decode error session=%s: %s", session_id, loop_error)
@@ -863,116 +957,190 @@ class DetectionService:
         return {"status": "failed", "session_id": session.session_id,
                 "processed_frames": processed}
 
-    def _process_one_frame(
-        self, *, session, frame, index, timestamp, conf, weight_name,
-        enable_classification, classification_weight_name, csv_writer, csv_file,
-        ocr_active, ocr_resolution, frame_prefix, create_video, temp_frames_dir,
-    ):
-        """Detect + persist a single frame. Mirrors the old per-frame block but
-        writes nothing to in-memory accumulators (flat memory).
+    def _draw_boxes(self, frame: np.ndarray, detections: List[dict]) -> np.ndarray:
+        """Burn detection boxes + labels onto a copy of the frame for display.
 
-        Ordering matters: the SSE progress feed runs in a DIFFERENT process and
-        emits a frame the instant its row is visible, then never re-emits it. If
-        we created the Frame and only attached its OCR job id afterwards, the
-        feed would emit the frame before the handle existed and the UI would
-        never see OCR. So we do the slow work (model + S3 uploads + OCR enqueue)
-        FIRST, then commit the Frame + its ocr_job_id + detections in ONE atomic
-        transaction — the feed only ever sees a fully-formed frame.
+        The detector service returns coordinates only (no rendered image), so we
+        draw them here — the dashboard shows this as the static frame and layers
+        interactive hover state on top of it.
+        """
+        img = frame.copy()
+        h = img.shape[0]
+        for d in detections:
+            try:
+                x1, y1, x2, y2 = (int(v) for v in d["bbox"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"{d.get('class_name', '')} {float(d.get('confidence', 0)):.2f}".strip()
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            ly = y1 - 4 if (y1 - th - 6) >= 0 else min(h - 2, y2 + th + 4)
+            cv2.rectangle(img, (x1, max(0, ly - th - 4)), (x1 + tw + 4, ly + 2),
+                          (0, 255, 0), -1)
+            cv2.putText(img, label, (x1 + 2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    def _detect_and_classify(
+        self, *, frame: np.ndarray, image_url: Optional[str], conf: float,
+        weight_name: Optional[str], enable_classification: bool,
+        classification_weight_name: Optional[str],
+    ) -> Tuple[List[dict], Optional[np.ndarray]]:
+        """Detect (+ classify) one frame -> (detections, annotated_or_None).
+
+        Detections are a uniform list of dicts: {bbox:[x1,y1,x2,y2], confidence,
+        class_id, class_name, classification:[{class_id,class_name,confidence,
+        rank}]|None}. Uses the external detector service when configured (needs a
+        public image_url); otherwise the in-process YOLO as a fallback. The local
+        path returns YOLO's own annotated frame so its display is unchanged; the
+        remote path returns None and we draw boxes from the coordinates.
+        """
+        if self.detector_client is not None and image_url:
+            dets = self.detector_client.detect(
+                image_url=image_url,
+                weight_name=weight_name,
+                classification_weight_name=(
+                    classification_weight_name if enable_classification else None
+                ),
+                confidence=conf,
+                classify=enable_classification,
+            )
+            return dets, None
+
+        # --- Local fallback (in-process YOLO) ---
+        results, annotated = self.model_service.detect_in_frame(
+            frame, conf, weight_name=weight_name
+        )
+        out: List[dict] = []
+        for det in results:
+            classification = None
+            if enable_classification:
+                raw = self._classify_detection(frame, det, classification_weight_name)
+                if raw:
+                    classification = [{**c, "rank": i} for i, c in enumerate(raw, 1)]
+            out.append({
+                "bbox": [det.bbox[0], det.bbox[1], det.bbox[2], det.bbox[3]],
+                "confidence": det.confidence,
+                "class_id": det.class_id,
+                "class_name": det.class_name,
+                "classification": classification,
+            })
+        return out, annotated
+
+    def _prepare_frame(
+        self, *, session, frame, index, timestamp, conf, weight_name,
+        enable_classification, classification_weight_name,
+        ocr_active, ocr_resolution, frame_prefix, create_video, temp_frames_dir,
+    ) -> dict:
+        """The SLOW per-frame I/O — S3 uploads + OCR enqueue + the detect call.
+
+        Runs in a worker thread and touches NO database, so many frames can be in
+        flight at once (the detector micro-batches the concurrent /detect calls).
+        Returns everything _commit_frame needs to persist the row.
+
+        Concurrency within a frame: we upload the RAW frame once, then enqueue OCR
+        (a separate worker) and call the detector — in THAT order — so OCR runs at
+        the same time as detection instead of waiting for it. OCR persists by
+        (session, frame_number), so it doesn't need the Frame row to exist yet.
+        """
+        frame_filename = f"frame_{frame_prefix}_{index:06d}.jpg"
+
+        # --- ONE S3 upload: the raw frame. It serves THREE purposes — the detect
+        # input, the OCR input, AND the dashboard's display image. The dashboard
+        # draws boxes client-side from the stored Detection coords, so we never
+        # upload a second boxed copy (that 2nd PUT was the slow redundant step). ---
+        ok, buf = cv2.imencode(".jpg", frame)
+        jpg_bytes = buf.tobytes() if ok else b""
+        image_url, s3_key, local_path = self._store_frame_image(
+            frame_filename, jpg_bytes, frame
+        )
+        is_public = image_url.startswith(("http://", "https://"))
+
+        # --- Fire OCR NOW so it runs CONCURRENTLY with the detection call below. ---
+        ocr_job_id = ""
+        if ocr_active and ocr_resolution:
+            if is_public:
+                prompt, meta = ocr_resolution
+                job_info = enqueue_ocr_job(
+                    image_url=image_url, prompt=prompt, prompt_meta=meta,
+                    session_id=session.session_id, frame_number=index,
+                )
+                ocr_job_id = (job_info or {}).get("id") or ""
+            else:
+                logger.warning(
+                    "OCR enabled but frame URL is not public (Spaces not "
+                    "configured?) — skipping OCR for frame %s", index,
+                )
+
+        # --- Detection + classification (external GPU service when configured,
+        # else local). Runs WHILE OCR is already in flight. ---
+        detections, annotated = self._detect_and_classify(
+            frame=frame, image_url=image_url if is_public else None, conf=conf,
+            weight_name=weight_name, enable_classification=enable_classification,
+            classification_weight_name=classification_weight_name,
+        )
+
+        # Boxes are burned in ONLY for the optional output video, and only to a
+        # LOCAL temp file (no S3 PUT). The dashboard never needs a boxed upload.
+        if create_video and temp_frames_dir is not None:
+            boxed = annotated if annotated is not None else (
+                self._draw_boxes(frame, detections) if detections else frame
+            )
+            cv2.imwrite(str(temp_frames_dir / frame_filename), boxed)
+
+        return {
+            "index": index, "timestamp": timestamp, "detections": detections,
+            "frame_url": image_url, "s3_key": s3_key, "local_path": local_path,
+            "ocr_job_id": ocr_job_id,
+        }
+
+    def _commit_frame(self, session, prepared: dict, csv_writer, csv_file) -> None:
+        """Persist ONE prepared frame. Called on the MAIN thread in frame order,
+        so rows become visible in sequence (the SSE feed shows frames in order)
+        and all DB/CSV work stays single-threaded — no locks, no per-thread
+        connections. Frame + ocr_job_id + detections commit in ONE atomic
+        transaction so the feed never sees a half-formed frame.
         """
         from django.db import IntegrityError, transaction
 
-        detections, annotated_frame = self.model_service.detect_in_frame(
-            frame, conf, weight_name=weight_name
-        )
-        if annotated_frame is None:
-            annotated_frame = frame
-
-        classification_data = []
-        if enable_classification:
-            for detection in detections:
-                classification = self._classify_detection(
-                    frame, detection, classification_weight_name
-                )
-                if classification:
-                    classification_data.append(classification)
-
-        # --- Slow, non-DB work first (kept OUT of the transaction) ---
-        frame_filename = f"frame_{frame_prefix}_{index:06d}.jpg"
-        ok, buf = cv2.imencode(".jpg", annotated_frame)
-        jpg_bytes = buf.tobytes() if ok else b""
-        frame_url, s3_key, local_path = self._store_frame_image(
-            frame_filename, jpg_bytes, annotated_frame
-        )
-
-        # OCR uses the ORIGINAL (un-annotated) frame so the burned-in boxes/labels
-        # aren't mis-read as text. Upload it now; enqueue happens in the txn below
-        # (needs the frame id) so the job id commits together with the frame.
-        ocr_url = None
-        if ocr_active and ocr_resolution:
-            ok_raw, raw_buf = cv2.imencode(".jpg", frame)
-            raw_bytes = raw_buf.tobytes() if ok_raw else b""
-            ocr_url, _, _ = self._store_frame_image(
-                f"ocr_{frame_filename}", raw_bytes, frame
-            )
-
-        if create_video and temp_frames_dir is not None:
-            cv2.imwrite(str(temp_frames_dir / frame_filename), annotated_frame)
-
-        # --- Fast DB writes, atomic so the frame becomes visible all-at-once ---
+        index = prepared["index"]
+        timestamp = prepared["timestamp"]
+        detections = prepared["detections"]
         try:
             with transaction.atomic():
                 db_frame = Frame.objects.create(
                     session=session,
                     frame_number=index,
-                    frame_path=local_path,
-                    frame_url=frame_url,
-                    s3_key=s3_key,
+                    frame_path=prepared["local_path"],
+                    frame_url=prepared["frame_url"],
+                    s3_key=prepared["s3_key"],
                     timestamp=timestamp,
                     total_detections=len(detections),
+                    ocr_job_id=prepared["ocr_job_id"],
                 )
 
-                # Enqueue OCR inside the txn so ocr_job_id is committed WITH the
-                # frame — the SSE feed never sees a frame missing its handle.
-                if ocr_active and ocr_resolution and ocr_url:
-                    if ocr_url.startswith(("http://", "https://")):
-                        prompt, meta = ocr_resolution
-                        job_info = enqueue_ocr_job(
-                            image_url=ocr_url, prompt=prompt, prompt_meta=meta,
-                            frame_id=db_frame.id,
-                        )
-                        jid = (job_info or {}).get("id")
-                        if jid:
-                            db_frame.ocr_job_id = jid
-                            db_frame.save(update_fields=["ocr_job_id"])
-                    else:
-                        logger.warning(
-                            "OCR enabled but frame URL is not public (Spaces not "
-                            "configured?) — skipping OCR for frame %s", index,
-                        )
-
-                for idx, detection in enumerate(detections):
+                for detection in detections:
+                    bbox = detection["bbox"]
                     db_detection = Detection.objects.create(
                         frame=db_frame,
                         session=session,
-                        class_id=detection.class_id,
-                        class_name=detection.class_name,
-                        confidence=detection.confidence,
-                        bbox_x1=detection.bbox[0],
-                        bbox_y1=detection.bbox[1],
-                        bbox_x2=detection.bbox[2],
-                        bbox_y2=detection.bbox[3],
+                        class_id=detection["class_id"],
+                        class_name=detection["class_name"],
+                        confidence=detection["confidence"],
+                        bbox_x1=bbox[0],
+                        bbox_y1=bbox[1],
+                        bbox_x2=bbox[2],
+                        bbox_y2=bbox[3],
                     )
-                    detection_classification = None
-                    if enable_classification and idx < len(classification_data):
-                        detection_classification = classification_data[idx]
+                    detection_classification = detection.get("classification") or None
                     if detection_classification:
-                        for rank, cls in enumerate(detection_classification, 1):
+                        for cls in detection_classification:
                             Classification.objects.create(
                                 detection=db_detection,
                                 class_id=cls["class_id"],
                                 class_name=cls["class_name"],
                                 confidence=cls["confidence"],
-                                rank=rank,
+                                rank=cls.get("rank") or 0,
                             )
                     self._write_to_realtime_csv(
                         csv_writer, csv_file, db_detection, index, timestamp,

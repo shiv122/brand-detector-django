@@ -2,12 +2,15 @@
 Shared service instances for API v1 controllers
 This ensures services are only initialized once, preventing duplicate logs
 """
+from django.conf import settings
+
 from config.app_config import AppConfig
 from apps.services.model.model_service import ModelService
 from apps.services.image.image_service import ImageService
 from apps.services.classification.classification_service import ClassificationService
 from apps.services.counting.counting_service import CountingService
 from apps.services.detection.detection_service import DetectionService
+from apps.services.detection.remote_detection_client import RemoteDetectionClient
 from apps.services.ocr.ocr_service import OcrService
 from apps.services.storage import SpacesService
 
@@ -24,6 +27,19 @@ _spaces_service = SpacesService(_config)
 # (when enabled per request) by the detection path to OCR each frame during
 # video processing.
 _ocr_service = OcrService(_config)
+
+# External detector service (its own GPU). When DETECTOR_HOST is set, detection +
+# classification run there over HTTP instead of in-process; unset => local YOLO.
+_detector_client = None
+if getattr(settings, "DETECTOR_HOST", ""):
+    _detector_client = RemoteDetectionClient(
+        host=settings.DETECTOR_HOST,
+        api_key=getattr(settings, "DETECTOR_API_KEY", ""),
+        timeout_seconds=getattr(settings, "DETECTOR_TIMEOUT_SECONDS", 60.0),
+        retries=getattr(settings, "DETECTOR_RETRIES", 3),
+        retry_base_delay=getattr(settings, "DETECTOR_RETRY_BASE_DELAY", 1.0),
+    )
+
 _detection_service = DetectionService(
     _config,
     _model_service,
@@ -32,5 +48,6 @@ _detection_service = DetectionService(
     _counting_service,
     _spaces_service,
     _ocr_service,
+    detector_client=_detector_client,
 )
 
