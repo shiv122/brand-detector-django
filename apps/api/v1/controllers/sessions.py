@@ -216,6 +216,19 @@ def session_detail(request, session_id):
     for row in detections_qs.values("class_name").annotate(count=Count("id")):
         logo_totals[row["class_name"]] = row["count"]
 
+    # RQ job ids for frames whose OCR still needs to land (no result yet, or an
+    # error result) AND that were actually enqueued. The detail page polls these
+    # via /ocr/jobs so that, after a resume, OCR shows as "running" (and the
+    # Resume button stays hidden) even on a fresh page load — and self-heals to
+    # "stalled" again if those jobs turn out to be gone/expired.
+    needs_ocr_q = Q(ocr_summary__isnull=True) | Q(ocr_summary__has_key="error")
+    ocr_pending_job_ids = list(
+        session.frames.filter(needs_ocr_q)
+        .exclude(ocr_job_id="")
+        .order_by("frame_number")
+        .values_list("ocr_job_id", flat=True)[:5000]
+    )
+
     return Response(
         {
             "session": {
@@ -240,11 +253,18 @@ def session_detail(request, session_id):
                 "completed_at": (
                     session.completed_at.isoformat() if session.completed_at else None
                 ),
+                # Whether OCR was configured for this run, so the UI can offer to
+                # resume it even when zero frames have a result yet.
+                "ocr_enabled": bool(
+                    (session.run_params or {}).get("enable_ocr")
+                    or (session.settings or {}).get("enable_ocr")
+                ),
             },
             "frames": frames,
             "logo_totals": logo_totals,
             "total_detections": detections_qs.count(),
             "unique_logos": list(logo_totals.keys()),
+            "ocr_pending_job_ids": ocr_pending_job_ids,
         }
     )
 
