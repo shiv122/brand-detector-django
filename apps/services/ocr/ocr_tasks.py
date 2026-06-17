@@ -26,6 +26,7 @@ _OCR_SERVICE = None
 _RESULT_KEEP_KEYS = frozenset({
     "formatted",
     "raw_text",
+    "blocks",            # per-region bounding boxes from the /parse path
     "error",
     "format_error",
     "warnings",

@@ -250,6 +250,10 @@ GLM_OCR_HOST = os.getenv("GLM_OCR_HOST", "http://localhost:8080")
 GLM_OCR_MODEL = os.getenv("GLM_OCR_MODEL", "glm-ocr")
 GLM_OCR_TIMEOUT_SECONDS = float(os.getenv("GLM_OCR_TIMEOUT_SECONDS", "120"))
 GLM_OCR_MAX_NEW_TOKENS = int(os.getenv("GLM_OCR_MAX_NEW_TOKENS", "2048"))
+# When set, the OCR client hits the worker's /parse (PP-DocLayoutV3 layout +
+# recognition) instead of /ocr, so each result carries per-region bounding
+# boxes ("blocks": [{index,label,content,bbox_2d:[x1,y1,x2,y2]}]).
+GLM_OCR_BOXES = os.getenv("GLM_OCR_BOXES", "").strip().lower() in ("1", "true", "yes")
 GLM_OCR_EXTRACT_PROMPT = os.getenv(
     "GLM_OCR_EXTRACT_PROMPT",
     "Extract all visible text from this image, preserving the original "

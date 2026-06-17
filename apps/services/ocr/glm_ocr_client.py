@@ -104,6 +104,63 @@ class GlmOcrClient:
 
         return None, {}
 
+    def extract_blocks(
+        self, image_url: str
+    ) -> tuple[Optional[str], list, dict]:
+        """POST /parse — returns (text, blocks, timing).
+
+        `blocks` is the glmocr pipeline's per-region output: a list of
+        {index, label, content, bbox_2d:[x1,y1,x2,y2]} (pixel coordinates).
+        text is None and blocks is [] on failure (see load_error()). The
+        worker drives its own per-region prompts, so no prompt is sent.
+        """
+        self._last_error = None
+        url = f"{self.host}/parse"
+        body = {"image_url": image_url, "model": self.model}
+
+        attempts = _retry_attempts()
+        base_delay = _retry_base_delay()
+        for attempt in range(1, attempts + 1):
+            t0 = time.monotonic()
+            try:
+                resp = requests.post(url, json=body, timeout=self.timeout_seconds)
+            except requests.RequestException as e:
+                self._last_error = f"GLM OCR /parse request failed: {e}"
+                if attempt < attempts:
+                    self._backoff(base_delay, attempt)
+                    continue
+                return None, [], {}
+
+            net_ms = int((time.monotonic() - t0) * 1000)
+
+            if resp.status_code in _RETRY_STATUSES and attempt < attempts:
+                self._backoff(base_delay, attempt)
+                continue
+
+            if resp.status_code != 200:
+                self._last_error = f"GLM OCR /parse HTTP {resp.status_code}: {resp.text[:200]}"
+                return None, [], {"network_ms": net_ms}
+
+            try:
+                data = resp.json()
+            except ValueError:
+                self._last_error = "GLM OCR /parse returned non-JSON response"
+                return None, [], {"network_ms": net_ms}
+
+            if isinstance(data, dict) and data.get("error"):
+                self._last_error = str(data["error"])
+                return None, [], {"network_ms": net_ms}
+
+            text = (data.get("text") or "").strip()
+            blocks = data.get("blocks") or []
+            if not isinstance(blocks, list):
+                blocks = []
+            timing = dict(data.get("timing_ms") or {})
+            timing["network_ms"] = net_ms
+            return text, blocks, timing
+
+        return None, [], {}
+
     @staticmethod
     def _backoff(base_delay: float, attempt: int) -> None:
         delay = base_delay * (2 ** (attempt - 1))

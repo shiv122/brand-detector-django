@@ -251,17 +251,27 @@ class OcrService:
             timeout_seconds=self.config.glm_ocr_timeout_seconds,
         )
 
+        boxes_mode = self.config.glm_ocr_boxes
+
         if debug:
             print(
                 f"\n[OCR/GLM] extract via external glm-ocr "
                 f"model={self.config.glm_ocr_model} "
                 f"host={self.config.glm_ocr_host} "
-                f"image_url={image_url}"
+                f"boxes={boxes_mode} image_url={image_url}"
             )
 
-        extracted_text, ocr_timing = engine.extract_text(
-            image_url, self.config.glm_ocr_extract_prompt
-        )
+        # Boxes mode hits the worker's /parse (PP-DocLayoutV3 layout +
+        # recognition) and returns per-region bounding boxes alongside the
+        # text. The custom extract prompt does NOT apply — the pipeline drives
+        # its own per-region prompts.
+        blocks: List[Dict[str, Any]] = []
+        if boxes_mode:
+            extracted_text, blocks, ocr_timing = engine.extract_blocks(image_url)
+        else:
+            extracted_text, ocr_timing = engine.extract_text(
+                image_url, self.config.glm_ocr_extract_prompt
+            )
         glm_timing: Dict[str, Any] = {
             "glm_ocr_backend": "glm-service",
             **{f"glm_ocr_{k}": v for k, v in ocr_timing.items()},
@@ -278,7 +288,7 @@ class OcrService:
             print(
                 f"[OCR/GLM] extract ok load={ocr_timing.get('load_ms', 0)}ms "
                 f"inf={ocr_timing.get('inference_ms', 0)}ms "
-                f"text_len={len(extracted_text)}"
+                f"text_len={len(extracted_text)} blocks={len(blocks)}"
             )
 
         # No stage-2 formatter configured → return the raw GLM text as-is.
@@ -287,6 +297,7 @@ class OcrService:
                 "provider": "local",
                 "raw_text": extracted_text,
                 "formatted": None,
+                "blocks": blocks,
                 "prompt": prompt,
                 "text_formatter_provider": None,
                 "timing_ms": glm_timing,
@@ -336,6 +347,7 @@ class OcrService:
             f"{timing_prefix}_model": format_result.get("model"),
             "text_formatter_provider": formatter_provider,
             "glm_ocr_text": extracted_text,
+            "blocks": blocks,
         }
         result = _parse_assistant_text(formatter_text, prompt, base)
         result["raw_text"] = extracted_text

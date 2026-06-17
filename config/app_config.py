@@ -54,6 +54,9 @@ class AppConfig:
         self.glm_ocr_max_new_tokens: int = int(
             getattr(settings, "GLM_OCR_MAX_NEW_TOKENS", 2048)
         )
+        # When true, call the worker's /parse (layout-aware) path so the result
+        # carries per-region bounding boxes ("blocks"); else the text-only /ocr.
+        self.glm_ocr_boxes: bool = bool(getattr(settings, "GLM_OCR_BOXES", False))
         self.glm_ocr_extract_prompt: str = getattr(
             settings,
             "GLM_OCR_EXTRACT_PROMPT",
