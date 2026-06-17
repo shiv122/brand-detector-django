@@ -40,6 +40,43 @@ class AppConfig:
             getattr(settings, "OCR_PROVIDER", "local")
         ).strip().lower() or "local"
 
+        # Which stage-1 OCR engine extracts text: "glm" (default, the GLM-OCR
+        # Ollama box) or "locate" (NVIDIA LocateAnything, returns text + boxes).
+        # Switched purely via the OCR_ENGINE env var — both feed the SAME stage-2
+        # formatter and return the SAME result shape, so nothing downstream
+        # (controllers, detection, frontend) changes when you flip it.
+        self.ocr_engine: str = str(
+            getattr(settings, "OCR_ENGINE", "glm")
+        ).strip().lower() or "glm"
+
+        # LocateAnything service (its own GPU). FastAPI /locate endpoint that
+        # fetches the image URL itself and returns boxes with the read text as
+        # labels. Used as the stage-1 extractor when OCR_ENGINE=locate.
+        self.locate_host: str = str(
+            getattr(settings, "LOCATE_HOST", "")
+        ).strip().rstrip("/")
+        self.locate_timeout_seconds: float = float(
+            getattr(settings, "LOCATE_TIMEOUT_SECONDS", 180)
+        )
+        # Task template + targets sent to /locate. For the "ocr" task an EMPTY
+        # query means "Detect all text in box format" (reads ALL visible text —
+        # the mode that actually OCRs); a non-empty query searches for that
+        # literal text instead.
+        self.locate_task: str = str(
+            getattr(settings, "LOCATE_TASK", "ocr")
+        ).strip().lower() or "ocr"
+        self.locate_query: str = getattr(settings, "LOCATE_QUERY", "")
+        self.locate_mode: str = str(
+            getattr(settings, "LOCATE_MODE", "hybrid")
+        ).strip().lower() or "hybrid"
+        self.locate_max_new_tokens: int = int(
+            getattr(settings, "LOCATE_MAX_NEW_TOKENS", 2048)
+        )
+        # Longest image side the service downscales to before inference. Higher
+        # detects more (small) text but uses more GPU memory; 0 disables it.
+        # None => don't send an override (the service uses its own default).
+        self.locate_max_side = getattr(settings, "LOCATE_MAX_SIDE", None)
+
         # External GLM OCR box (its own GPU). Speaks the Ollama /api/chat
         # protocol; point GLM_OCR_HOST at the deployed service.
         self.glm_ocr_host: str = getattr(

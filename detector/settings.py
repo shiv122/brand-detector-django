@@ -243,6 +243,12 @@ SPACES_FRAMES_PREFIX = os.getenv("DO_FRAMES_PREFIX", "frames").strip().strip("/"
 # JSON. OCR_PROVIDER stays so future providers can be slotted in.
 OCR_PROVIDER = os.getenv("OCR_PROVIDER", "local").strip().lower() or "local"
 
+# Stage-1 OCR engine switch: "glm" (default) or "locate" (NVIDIA
+# LocateAnything). Flip OCR_ENGINE in the env to swap which box extracts the
+# text — both feed the same stage-2 formatter and produce the same result
+# shape, so nothing else changes.
+OCR_ENGINE = os.getenv("OCR_ENGINE", "glm").strip().lower() or "glm"
+
 # External GLM OCR service (its own GPU). FastAPI /ocr endpoint that fetches
 # the image URL itself. Retry knobs are read directly from the env by the
 # client (GLM_OCR_RETRIES / GLM_OCR_RETRY_BASE_DELAY).
@@ -255,6 +261,25 @@ GLM_OCR_EXTRACT_PROMPT = os.getenv(
     "Extract all visible text from this image, preserving the original "
     "layout, line breaks, and reading order. Return only the extracted text.",
 )
+
+# LocateAnything service (its own GPU) — used as the stage-1 extractor when
+# OCR_ENGINE=locate. FastAPI /locate endpoint that fetches the image URL and
+# returns boxes whose labels are the read text. LOCATE_QUERY is the
+# comma-separated set of things to read (it fills the "ocr" task template).
+LOCATE_HOST = os.getenv("LOCATE_HOST", "").strip().rstrip("/")
+LOCATE_TIMEOUT_SECONDS = float(os.getenv("LOCATE_TIMEOUT_SECONDS", "180"))
+LOCATE_TASK = os.getenv("LOCATE_TASK", "ocr").strip().lower() or "ocr"
+# Empty = "Detect all text in box format" (reads ALL visible text — the mode
+# that actually OCRs). A non-empty value makes the model search for that
+# literal text instead, so leave it blank for general OCR.
+LOCATE_QUERY = os.getenv("LOCATE_QUERY", "")
+LOCATE_MODE = os.getenv("LOCATE_MODE", "hybrid").strip().lower() or "hybrid"
+LOCATE_MAX_NEW_TOKENS = int(os.getenv("LOCATE_MAX_NEW_TOKENS", "2048"))
+# Longest image side the service downscales to before inference. Bigger = more
+# text detected (less downscaling) but more GPU memory; 0 disables downscaling.
+# Unset => let the service use its own default. Set it to raise OCR recall.
+_LOCATE_MAX_SIDE = os.getenv("LOCATE_MAX_SIDE")
+LOCATE_MAX_SIDE = int(_LOCATE_MAX_SIDE) if _LOCATE_MAX_SIDE not in (None, "") else None
 
 # External detector service (its own GPU) — detection + classification. When
 # DETECTOR_HOST is set, video frames are detected+classified by the remote box

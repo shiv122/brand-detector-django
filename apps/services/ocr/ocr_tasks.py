@@ -37,6 +37,10 @@ _RESULT_KEEP_KEYS = frozenset({
     "deepseek_text_model",
     "gemini_text_id",
     "gemini_text_model",
+    # LocateAnything: read-text boxes + the original image size, so the UI can
+    # draw the boxes over the frame (engine=locate only; absent for GLM).
+    "boxes",
+    "image_size",
 })
 
 # Defence-in-depth: keys that could ever carry image bytes/base64. The OCR

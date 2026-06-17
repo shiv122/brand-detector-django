@@ -193,25 +193,19 @@ def session_detail(request, session_id):
     except ProcessingSession.DoesNotExist:
         return Response({"error": "Session not found"}, status=404)
 
-    frames_qs = (
-        session.frames.all()
-        .order_by("frame_number")
-        .prefetch_related(
-            Prefetch(
-                "detections",
-                queryset=Detection.objects.order_by("-confidence").prefetch_related(
-                    Prefetch(
-                        "classifications",
-                        queryset=Classification.objects.order_by("rank"),
-                    )
-                ),
-            )
-        )
+    # The detail payload no longer ships every frame — that grew unbounded on
+    # long videos and made this page slow to fetch and laggy to render. Frames
+    # are paginated via /session/<id>/frames (newest window first, scroll back
+    # for older). Here we only compute the run-level aggregates the page needs.
+    frames_stored = session.frames.count()
+    ocr_done = (
+        session.frames.filter(ocr_summary__isnull=False)
+        .exclude(ocr_summary__has_key="error")
+        .count()
     )
 
-    frames = [_serialize_frame(f) for f in frames_qs]
-
     detections_qs = session.detections.all()
+    avg_confidence = detections_qs.aggregate(avg=Avg("confidence"))["avg"]
     logo_totals = {}
     for row in detections_qs.values("class_name").annotate(count=Count("id")):
         logo_totals[row["class_name"]] = row["count"]
@@ -260,11 +254,94 @@ def session_detail(request, session_id):
                     or (session.settings or {}).get("enable_ocr")
                 ),
             },
-            "frames": frames,
+            # Frames themselves come from /session/<id>/frames; these are the
+            # run-level rollups the detail page renders without them.
+            "frames_stored": frames_stored,
+            "ocr_done": ocr_done,
+            "avg_confidence": avg_confidence,
             "logo_totals": logo_totals,
             "total_detections": detections_qs.count(),
             "unique_logos": list(logo_totals.keys()),
             "ocr_pending_job_ids": ocr_pending_job_ids,
+        }
+    )
+
+
+@extend_schema(
+    summary="Paginated frames for a session (newest window first)",
+    description=(
+        "Returns a window of stored frames ordered by frame_number ascending. "
+        "Without `before`, returns the newest `limit` frames. To page backwards "
+        "through history, pass `before=<oldest_frame_number returned>` to get the "
+        "previous (older) window. Optionally filter to frames containing a given "
+        "brand via `brand`."
+    ),
+    parameters=[
+        OpenApiParameter(name="session_id", type=OpenApiTypes.STR, location=OpenApiParameter.PATH),
+        OpenApiParameter(name="limit", type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False),
+        OpenApiParameter(name="before", type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False, description="Return frames with frame_number < before (older window)."),
+        OpenApiParameter(name="brand", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description="Only frames containing a detection of this class_name."),
+    ],
+)
+@api_view(["GET"])
+def session_frames(request, session_id):
+    try:
+        session = ProcessingSession.objects.get(session_id=session_id)
+    except ProcessingSession.DoesNotExist:
+        return Response({"error": "Session not found"}, status=404)
+
+    try:
+        limit = max(1, min(int(request.GET.get("limit", 100)), 200))
+    except (TypeError, ValueError):
+        limit = 100
+
+    # Base set, optionally narrowed to frames that contain a given brand. The
+    # join can multiply rows (one per matching detection), so distinct().
+    qs = session.frames.all()
+    brand = (request.GET.get("brand") or "").strip()
+    if brand:
+        qs = qs.filter(detections__class_name=brand).distinct()
+
+    total = qs.count()  # total matching frames, for the "x / total" label
+
+    window_qs = qs
+    before = request.GET.get("before")
+    if before not in (None, ""):
+        try:
+            window_qs = window_qs.filter(frame_number__lt=int(before))
+        except (TypeError, ValueError):
+            pass
+
+    # Newest `limit` frames of the window: pull descending (uses the
+    # (session, frame_number) index), then reverse to ascending so the response
+    # reads left→right oldest→newest like the timeline.
+    page_desc = list(
+        window_qs.order_by("-frame_number").prefetch_related(
+            Prefetch(
+                "detections",
+                queryset=Detection.objects.order_by("-confidence").prefetch_related(
+                    Prefetch(
+                        "classifications",
+                        queryset=Classification.objects.order_by("rank"),
+                    )
+                ),
+            )
+        )[:limit]
+    )
+    page = list(reversed(page_desc))
+
+    oldest = page[0].frame_number if page else None
+    # Are there still older frames before this window? Cheap existence probe.
+    has_more = bool(oldest is not None and qs.filter(frame_number__lt=oldest).exists())
+
+    return Response(
+        {
+            "frames": [_serialize_frame(f) for f in page],
+            "has_more": has_more,
+            "oldest_frame_number": oldest,
+            "newest_frame_number": page[-1].frame_number if page else None,
+            "count": len(page),
+            "total": total,
         }
     )
 
@@ -563,6 +640,11 @@ urlpatterns = [
         r"session/(?P<session_id>[^/]+)/detail",
         session_detail,
         name="session-detail",
+    ),
+    *optional_slash_path(
+        r"session/(?P<session_id>[^/]+)/frames",
+        session_frames,
+        name="session-frames",
     ),
     *optional_slash_path(
         r"session/(?P<session_id>[^/]+)/export-xlsx",

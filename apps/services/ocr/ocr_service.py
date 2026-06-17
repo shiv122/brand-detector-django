@@ -210,9 +210,11 @@ class OcrService:
         return self.config.ocr_provider
 
     def is_available(self) -> bool:
-        # Only the external GLM OCR endpoint is required. The stage-2 text
-        # formatter (DeepSeek/Gemini) is optional — without it we return the
-        # raw extracted text instead of structured JSON.
+        # The stage-1 extractor's endpoint must be configured for the SELECTED
+        # engine. The stage-2 text formatter (DeepSeek/Gemini) is optional —
+        # without it we return the raw extracted text instead of structured JSON.
+        if self.config.ocr_engine == "locate":
+            return bool(self.config.locate_host)
         return bool(self.config.glm_ocr_host and self.config.glm_ocr_model)
 
     def _formatter_configured(self) -> bool:
@@ -230,6 +232,10 @@ class OcrService:
                 ),
                 "prompt": prompt,
             }
+        # Stage-1 engine is env-selected; both paths share the stage-2 formatter
+        # and return the same result shape.
+        if self.config.ocr_engine == "locate":
+            return self._run_locate(image_url, prompt)
         return self._run_local(image_url, prompt)
 
     # ----------------------------------------------------------------- local
@@ -340,6 +346,126 @@ class OcrService:
         result = _parse_assistant_text(formatter_text, prompt, base)
         result["raw_text"] = extracted_text
         result["formatter_raw_text"] = formatter_text
+        return result
+
+    # --------------------------------------------------------------- locate
+
+    def _run_locate(self, image_url: str, prompt: str) -> Dict[str, Any]:
+        """Stage 1 via LocateAnything; stage 2 is the same formatter as GLM.
+
+        LocateAnything reads the text (and where it is) in one call; we hand the
+        readable text to the DeepSeek/Gemini formatter exactly as the GLM path
+        does, so the result shape stays identical and `prompt` keeps acting as
+        the stage-2 system prompt.
+        """
+        formatter_provider = self.config.text_formatter_provider
+        formatter_configured = self._formatter_configured()
+        debug = _ocr_debug_enabled()
+
+        from apps.services.ocr.locate_anything_client import LocateAnythingClient
+
+        engine = LocateAnythingClient(
+            host=self.config.locate_host,
+            timeout_seconds=self.config.locate_timeout_seconds,
+        )
+        task = self.config.locate_task
+        query = self.config.locate_query
+
+        if debug:
+            print(
+                f"\n[OCR/Locate] extract via LocateAnything "
+                f"host={self.config.locate_host} task={task} query={query!r} "
+                f"image_url={image_url}"
+            )
+
+        extracted_text, boxes, image_size, loc_timing = engine.extract_text(
+            image_url,
+            task=task,
+            query=query,
+            mode=self.config.locate_mode,
+            max_new_tokens=self.config.locate_max_new_tokens,
+            max_side=self.config.locate_max_side,
+        )
+        locate_timing: Dict[str, Any] = {
+            "ocr_engine": "locate",
+            **{f"locate_{k}": v for k, v in loc_timing.items()},
+        }
+
+        if extracted_text is None:
+            return {
+                "error": engine.load_error() or "LocateAnything extraction failed.",
+                "prompt": prompt,
+                "timing_ms": locate_timing,
+            }
+
+        if debug:
+            print(
+                f"[OCR/Locate] extract ok boxes={len(boxes)} "
+                f"text_len={len(extracted_text)}"
+            )
+
+        # Boxes (read text + pixel coords) + the original image size so the UI
+        # can draw the boxes over the image. Carried on every non-failure return.
+        loc_extra = {"boxes": boxes, "image_size": image_size}
+
+        # No stage-2 formatter configured → return the raw read text as-is.
+        if not formatter_configured:
+            return {
+                "provider": "local",
+                "raw_text": extracted_text,
+                "formatted": None,
+                "prompt": prompt,
+                "text_formatter_provider": None,
+                "timing_ms": locate_timing,
+                **loc_extra,
+            }
+
+        if formatter_provider == "gemini":
+            format_result = self._call_gemini_text(prompt, extracted_text)
+            timing_prefix = "gemini_text"
+        else:
+            format_result = self._call_deepseek_text(prompt, extracted_text)
+            timing_prefix = "deepseek_text"
+
+        if "error" in format_result:
+            return {
+                **format_result,
+                "raw_text": extracted_text,
+                "prompt": prompt,
+                "provider": "local",
+                "timing_ms": {
+                    **locate_timing,
+                    **format_result.get("timing_ms", {}),
+                },
+                **loc_extra,
+            }
+
+        formatter_text = format_result["text"]
+        usage = format_result.get("usage", {})
+
+        if debug:
+            print(
+                f"[OCR/Locate] format via {formatter_provider} "
+                f"model={format_result.get('model')} "
+                f"net={format_result.get('network_ms', 0)}ms"
+            )
+
+        base = {
+            "provider": "local",
+            "timing_ms": {
+                **locate_timing,
+                f"{timing_prefix}_network": format_result.get("network_ms"),
+                f"{timing_prefix}_completion_tokens": usage.get("completion_tokens"),
+                f"{timing_prefix}_total_tokens": usage.get("total_tokens"),
+            },
+            f"{timing_prefix}_id": format_result.get("response_id"),
+            f"{timing_prefix}_model": format_result.get("model"),
+            "text_formatter_provider": formatter_provider,
+        }
+        result = _parse_assistant_text(formatter_text, prompt, base)
+        result["raw_text"] = extracted_text
+        result["formatter_raw_text"] = formatter_text
+        result.update(loc_extra)
         return result
 
     # ---------------------------------------------- DeepSeek text helper
