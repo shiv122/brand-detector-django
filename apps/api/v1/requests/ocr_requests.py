@@ -5,12 +5,14 @@ OCR request validation classes.
 import re
 
 from apps.api.v1.requests.base_request import BaseRequest
-from apps.utils.prompt_render import normalize_brands
+from apps.utils.prompt_render import dedupe_phrases
 
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$")
 _MAX_BRANDS = 256
 _MAX_BRAND_LEN = 64
+_MAX_TAGLINES = 256
+_MAX_TAGLINE_LEN = 160
 
 
 class OcrRunRequest(BaseRequest):
@@ -77,29 +79,31 @@ class SportPromptUpsertRequest(BaseRequest):
         if self.data.get("prompt"):
             self._string("prompt", min_length=1, max_length=16384)
 
-        # allowed_brands: list of strings, normalized to snake_case and deduped.
-        # Anything not a list is rejected; non-string entries are dropped.
-        raw_brands = self.data.get("allowed_brands", [])
-        if raw_brands in (None, ""):
-            self.data["allowed_brands"] = []
-        elif not isinstance(raw_brands, list):
-            self._add_error("allowed_brands", "allowed_brands must be a list of strings")
-            self.data["allowed_brands"] = []
+        # allowed_brands / taglines: lists of display-form strings, cleaned
+        # (trim + collapse whitespace) and case-insensitively deduped while
+        # preserving the original spelling. Anything not a list is rejected;
+        # non-string entries are dropped.
+        self.data["allowed_brands"] = self._clean_phrase_list(
+            "allowed_brands", _MAX_BRANDS, _MAX_BRAND_LEN
+        )
+        self.data["taglines"] = self._clean_phrase_list(
+            "taglines", _MAX_TAGLINES, _MAX_TAGLINE_LEN
+        )
+
+        # correction_enabled: opt-in toggle for the brand/tagline correction
+        # guide. Accept real bools and the usual truthy strings from forms.
+        raw_enabled = self.data.get("correction_enabled", False)
+        if isinstance(raw_enabled, bool):
+            self.data["correction_enabled"] = raw_enabled
+        elif isinstance(raw_enabled, str):
+            self.data["correction_enabled"] = raw_enabled.strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
         else:
-            string_brands = [b for b in raw_brands if isinstance(b, str)]
-            if any(len(b) > _MAX_BRAND_LEN for b in string_brands):
-                self._add_error(
-                    "allowed_brands",
-                    f"each brand must be <= {_MAX_BRAND_LEN} chars",
-                )
-            cleaned = normalize_brands(string_brands)
-            if len(cleaned) > _MAX_BRANDS:
-                self._add_error(
-                    "allowed_brands",
-                    f"allowed_brands accepts at most {_MAX_BRANDS} entries",
-                )
-                cleaned = cleaned[:_MAX_BRANDS]
-            self.data["allowed_brands"] = cleaned
+            self.data["correction_enabled"] = bool(raw_enabled)
 
         # Optional reference image (data URL or raw base64). Capped at ~6 MB.
         ref = self.data.get("reference_image")
@@ -115,3 +119,19 @@ class SportPromptUpsertRequest(BaseRequest):
                 self.data["reference_image"] = None
             elif not ref.strip():
                 self.data["reference_image"] = None
+
+    def _clean_phrase_list(self, field: str, max_items: int, max_len: int) -> list:
+        raw = self.data.get(field, [])
+        if raw in (None, ""):
+            return []
+        if not isinstance(raw, list):
+            self._add_error(field, f"{field} must be a list of strings")
+            return []
+        strings = [s for s in raw if isinstance(s, str)]
+        if any(len(s) > max_len for s in strings):
+            self._add_error(field, f"each entry must be <= {max_len} chars")
+        cleaned = dedupe_phrases(strings)
+        if len(cleaned) > max_items:
+            self._add_error(field, f"{field} accepts at most {max_items} entries")
+            cleaned = cleaned[:max_items]
+        return cleaned

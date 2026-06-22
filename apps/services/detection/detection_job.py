@@ -30,7 +30,15 @@ def run_detection(session_id: str, start_frame: int = 0) -> dict:
     the heavy model stack. In the worker process the first call loads the
     shared services once; subsequent jobs reuse them.
     """
+    from django.db import close_old_connections
+
     from apps.api.v1.shared_services import _detection_service
+
+    # Worker processes are long-lived and cache the Django DB connection
+    # between jobs. MySQL (or a proxy) drops idle connections, leaving a dead
+    # socket that fails the first query with InterfaceError(0, ''). Drop any
+    # stale/expired connection so this job opens a fresh one.
+    close_old_connections()
 
     return _detection_service.process_session(session_id, start_frame=start_frame)
 

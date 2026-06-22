@@ -139,10 +139,18 @@ def _resolve_prompt(inline_prompt: str, prompt_slug: str, sport: str):
         )
 
     allowed_brands = list(sp.allowed_brands or [])
+    taglines = list(sp.taglines or [])
+    correction_enabled = bool(sp.correction_enabled)
     meta = {"source": source, "slug": sp.slug, "name": sp.name, "sport": sp.sport}
-    if allowed_brands:
+    if correction_enabled and allowed_brands:
         meta["allowed_brands"] = allowed_brands
-    return render_prompt(sp.prompt, allowed_brands), meta, None
+    if correction_enabled and taglines:
+        meta["taglines"] = taglines
+    return (
+        render_prompt(sp.prompt, allowed_brands, taglines, correction_enabled),
+        meta,
+        None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +253,8 @@ def _serialize_prompt(p: SportPrompt) -> dict:
         "description": p.description or "",
         "prompt": p.prompt,
         "allowed_brands": list(p.allowed_brands or []),
+        "taglines": list(p.taglines or []),
+        "correction_enabled": bool(p.correction_enabled),
         "reference_image_path": p.reference_image_path or "",
         "reference_image_url": _reference_image_url(p.reference_image_path or ""),
         "created_at": p.created_at.isoformat() if p.created_at else None,
@@ -279,6 +289,8 @@ def sport_prompts(request):
         description=data.get("description", ""),
         prompt=data["prompt"],
         allowed_brands=data.get("allowed_brands", []),
+        taglines=data.get("taglines", []),
+        correction_enabled=data.get("correction_enabled", False),
         reference_image_path=ref_rel or "",
     )
     return Response(_serialize_prompt(p), status=status.HTTP_201_CREATED)
@@ -323,6 +335,8 @@ def sport_prompt_detail(request, slug: str):
     p.description = data.get("description", "")
     p.prompt = data["prompt"]
     p.allowed_brands = data.get("allowed_brands", [])
+    p.taglines = data.get("taglines", [])
+    p.correction_enabled = data.get("correction_enabled", False)
 
     if "reference_image" in (request.data or {}):
         raw = data.get("reference_image")

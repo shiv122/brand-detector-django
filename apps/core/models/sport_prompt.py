@@ -14,9 +14,17 @@ class SportPrompt(models.Model):
     sport = models.CharField(max_length=64, blank=True, db_index=True)
     description = models.TextField(blank=True)
     prompt = models.TextField()
-    # Whitelist of brand identifiers (snake_case) substituted into the prompt
-    # wherever the `{{BRAND_LIST}}` placeholder appears at run time.
+    # Canonical brand names in display form (e.g. "Coca-Cola"). Substituted
+    # into the prompt wherever the `{{BRAND_LIST}}` placeholder appears, and
+    # used as the closed vocabulary the formatter corrects noisy OCR towards.
     allowed_brands = models.JSONField(default=list, blank=True)
+    # Canonical taglines / slogans in display form (e.g. "Just Do It"). Same
+    # role as allowed_brands but for multi-word phrases.
+    taglines = models.JSONField(default=list, blank=True)
+    # When on, the brand/tagline correction guide (+ vocabulary) is appended to
+    # the rendered prompt so the formatter snaps noisy OCR onto the canonical
+    # entries. When off, brands/taglines are stored but never sent to the model.
+    correction_enabled = models.BooleanField(default=False)
     reference_image_path = models.CharField(max_length=500, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)

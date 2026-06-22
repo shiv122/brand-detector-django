@@ -284,15 +284,22 @@ class DetectionService:
             sp = SportPrompt.objects.filter(slug=slug).first()
             if sp is not None:
                 brands = list(sp.allowed_brands or [])
+                taglines = list(sp.taglines or [])
+                correction_enabled = bool(sp.correction_enabled)
                 meta = {
                     "source": "stored",
                     "slug": sp.slug,
                     "name": sp.name,
                     "sport": sp.sport,
                 }
-                if brands:
+                if correction_enabled and brands:
                     meta["allowed_brands"] = brands
-                return render_prompt(sp.prompt, brands), meta
+                if correction_enabled and taglines:
+                    meta["taglines"] = taglines
+                return (
+                    render_prompt(sp.prompt, brands, taglines, correction_enabled),
+                    meta,
+                )
 
         if sport:
             sport_lower = sport.lower()
@@ -304,15 +311,22 @@ class DetectionService:
             )
             if sp is not None:
                 brands = list(sp.allowed_brands or [])
+                taglines = list(sp.taglines or [])
+                correction_enabled = bool(sp.correction_enabled)
                 meta = {
                     "source": "sport",
                     "slug": sp.slug,
                     "name": sp.name,
                     "sport": sp.sport,
                 }
-                if brands:
+                if correction_enabled and brands:
                     meta["allowed_brands"] = brands
-                return render_prompt(sp.prompt, brands), meta
+                if correction_enabled and taglines:
+                    meta["taglines"] = taglines
+                return (
+                    render_prompt(sp.prompt, brands, taglines, correction_enabled),
+                    meta,
+                )
         return None
 
     def update_config(self, data: dict) -> Response:
@@ -695,6 +709,11 @@ class DetectionService:
         cancelled = False
         try:
             video_path, is_temp = self._resolve_source(session)
+            # Resolving the source can download a large file for minutes — long
+            # enough for the connection opened above to be killed by MySQL's
+            # wait_timeout. Drop any now-stale connection before resuming writes.
+            from django.db import close_old_connections
+            close_old_connections()
             session.video_path = video_path
             session.save(update_fields=["video_path", "updated_at"])
 
@@ -1223,14 +1242,21 @@ class DetectionService:
         ocr_enabled = bool(run_params.get("enable_ocr"))
         # Frames we've streamed that don't have their (async) OCR result yet.
         pending_ocr: set = set()
-        # OCR finishes AFTER detection, so once detection is done keep the feed
-        # open briefly to deliver late results — bounded so a stuck/failed OCR
-        # job can't hang the stream forever (~30s).
-        drain_polls = int(30 / poll_interval) if poll_interval else 60
+        # OCR finishes AFTER detection — usually as a large backlog, since OCR is
+        # far slower than detection. Keep the feed open while OCR is still
+        # LANDING (the budget resets on every new result below), and give up only
+        # after a stretch with NO new OCR (~60s) so a stuck/failed job can't hang
+        # the stream forever. A fixed cap would cut off big backlogs mid-drain.
+        drain_max_idle = int(60 / poll_interval) if poll_interval else 120
+        drain_idle = drain_max_idle
         try:
             while True:
                 close_old_connections()
                 session.refresh_from_db()
+
+                # Whether this iteration delivered any late OCR result — used to
+                # keep the post-detection drain alive while OCR is progressing.
+                emitted_ocr = False
 
                 new_frames = list(
                     Frame.objects.filter(session=session, frame_number__gt=last)
@@ -1251,6 +1277,7 @@ class DetectionService:
                     ).exclude(ocr_summary__isnull=True)
                     for f in ready:
                         pending_ocr.discard(f.frame_number)
+                        emitted_ocr = True
                         yield _sse({
                             "type": "ocr_result",
                             "frame_id": f.id,
@@ -1278,9 +1305,11 @@ class DetectionService:
                     session=session, frame_number__gt=last
                 ).exists()
                 if terminal and not more:
-                    # Detection is done, but keep draining late OCR results.
-                    if ocr_enabled and pending_ocr and drain_polls > 0:
-                        drain_polls -= 1
+                    # Detection is done, but keep draining late OCR results. Reset
+                    # the idle budget whenever a result landed this poll so a big
+                    # backlog drains fully; only count down on no-progress polls.
+                    if ocr_enabled and pending_ocr and drain_idle > 0:
+                        drain_idle = drain_max_idle if emitted_ocr else drain_idle - 1
                         yield ": ocr-drain\n\n"
                         time.sleep(poll_interval)
                         continue
