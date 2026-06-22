@@ -391,6 +391,64 @@ def _ocr_raw_text(ocr_summary) -> str:
     return ""
 
 
+def _ocr_box_coords(ocr_summary) -> str:
+    """Flatten the per-region OCR bounding boxes into a readable string.
+
+    Reads ocr_summary["blocks"] (the /parse path output) where each block is
+    {index, label, content, bbox_2d:[x1,y1,x2,y2]} in pixel coordinates, and
+    renders one region per line as: "<content> [x1,y1,x2,y2]".
+    """
+    if not isinstance(ocr_summary, dict):
+        return ""
+    blocks = ocr_summary.get("blocks")
+    if not isinstance(blocks, list):
+        return ""
+    lines = []
+    for blk in blocks:
+        if not isinstance(blk, dict):
+            continue
+        bbox = blk.get("bbox_2d")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        coords = ",".join(str(int(round(v))) for v in bbox[:4])
+        content = str(blk.get("content", "")).strip()
+        lines.append(f"{content} [{coords}]" if content else f"[{coords}]")
+    return "\n".join(lines)
+
+
+def _ocr_box_rows(ocr_summary):
+    """Yield one structured record per OCR region for the reproducible sheet.
+
+    Each record carries the discrete pixel coordinates so the box can be
+    redrawn on the source frame image: (index, label, content, x1, y1, x2, y2).
+    Coordinates are absolute pixels in the OCR'd image's coordinate space.
+    """
+    if not isinstance(ocr_summary, dict):
+        return
+    blocks = ocr_summary.get("blocks")
+    if not isinstance(blocks, list):
+        return
+    for blk in blocks:
+        if not isinstance(blk, dict):
+            continue
+        bbox = blk.get("bbox_2d")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        try:
+            x1, y1, x2, y2 = (int(round(float(v))) for v in bbox[:4])
+        except (TypeError, ValueError):
+            continue
+        yield {
+            "index": blk.get("index"),
+            "label": str(blk.get("label", "")),
+            "content": str(blk.get("content", "")).strip(),
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+        }
+
+
 def _xlsx_export_path(session: ProcessingSession) -> Path:
     static_dir = getattr(settings, "STATIC_ROOT", None) or os.path.join(
         settings.BASE_DIR, "staticfiles"
@@ -406,7 +464,8 @@ def _xlsx_export_path(session: ProcessingSession) -> Path:
     summary="Export session as XLSX (project report format)",
     description=(
         "Generate an Excel workbook with one row per (frame, brand) aggregation. "
-        "Columns: Project Name, Image, Brand, Instances, Size, OCR Raw Text."
+        "Columns: Project Name, Image, Brand, Instances, Size, OCR Raw Text, "
+        "OCR Box Coordinates."
     ),
     parameters=[
         OpenApiParameter(name="session_id", type=OpenApiTypes.STR, location=OpenApiParameter.PATH),
@@ -451,6 +510,7 @@ def export_session_xlsx(request, session_id):
         "Classification",
         "Size",
         "Raw Text",
+        "OCR Box Coordinates",
     ]
     ws.append(headers)
     header_font = Font(bold=True, color="FFFFFF")
@@ -471,6 +531,7 @@ def export_session_xlsx(request, session_id):
         # (the Spaces flow stores frame_path="" and keeps the URL on frame_url).
         image_name = os.path.basename((frame.frame_path or frame.frame_url or "").split("?")[0])
         ocr_text = _ocr_raw_text(frame.ocr_summary)
+        ocr_boxes = _ocr_box_coords(frame.ocr_summary)
 
         # Group detections by brand within this frame
         by_brand: dict[str, list[Detection]] = defaultdict(list)
@@ -512,14 +573,65 @@ def export_session_xlsx(request, session_id):
             ws.cell(row=row_idx, column=7, value=classification_str)
             ws.cell(row=row_idx, column=8, value=size_str)
             ws.cell(row=row_idx, column=9, value=ocr_text)
+            box_cell = ws.cell(row=row_idx, column=10, value=ocr_boxes)
+            box_cell.alignment = Alignment(wrap_text=True, vertical="top")
             row_idx += 1
 
     # Column widths — keep it readable; classification + OCR get more space.
-    widths = [22, 8, 12, 26, 22, 10, 30, 12, 60]
+    widths = [22, 8, 12, 26, 22, 10, 30, 12, 60, 50]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + i)].width = w
 
     ws.freeze_panes = "A2"
+
+    # Second sheet: one row per OCR region with discrete pixel coordinates, so a
+    # user can reproduce (redraw) each box on the named/linked frame image.
+    ws_ocr = wb.create_sheet("OCR Boxes")
+    ocr_headers = [
+        "Frame #",
+        "Timestamp (s)",
+        "Image",
+        "Image URL",
+        "Region #",
+        "Label",
+        "Text",
+        "X1",
+        "Y1",
+        "X2",
+        "Y2",
+    ]
+    ws_ocr.append(ocr_headers)
+    for col_idx in range(1, len(ocr_headers) + 1):
+        cell = ws_ocr.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    ocr_row = 2
+    for frame in frames_qs:
+        boxes = list(_ocr_box_rows(frame.ocr_summary))
+        if not boxes:
+            continue
+        image_name = os.path.basename((frame.frame_path or frame.frame_url or "").split("?")[0])
+        ts = round(frame.timestamp or 0, 2)
+        for b in boxes:
+            ws_ocr.cell(row=ocr_row, column=1, value=frame.frame_number)
+            ws_ocr.cell(row=ocr_row, column=2, value=ts)
+            ws_ocr.cell(row=ocr_row, column=3, value=image_name)
+            ws_ocr.cell(row=ocr_row, column=4, value=frame.frame_url or "")
+            ws_ocr.cell(row=ocr_row, column=5, value=b["index"])
+            ws_ocr.cell(row=ocr_row, column=6, value=b["label"])
+            ws_ocr.cell(row=ocr_row, column=7, value=b["content"])
+            ws_ocr.cell(row=ocr_row, column=8, value=b["x1"])
+            ws_ocr.cell(row=ocr_row, column=9, value=b["y1"])
+            ws_ocr.cell(row=ocr_row, column=10, value=b["x2"])
+            ws_ocr.cell(row=ocr_row, column=11, value=b["y2"])
+            ocr_row += 1
+
+    ocr_widths = [8, 12, 26, 40, 9, 18, 50, 8, 8, 8, 8]
+    for i, w in enumerate(ocr_widths, start=1):
+        ws_ocr.column_dimensions[chr(64 + i)].width = w
+    ws_ocr.freeze_panes = "A2"
 
     out_path = _xlsx_export_path(session)
     wb.save(out_path)
